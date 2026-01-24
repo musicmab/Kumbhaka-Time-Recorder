@@ -10,17 +10,35 @@ struct ContentView: View {
     // 進行中セッション
     @State private var currentSession: SessionRecord?
 
+    // 計測基準時刻
     @State private var startDate: Date?
     @State private var record1Date: Date?
 
+    // 秒数表示モード
+    private enum DisplayMode {
+        case none
+        case startToR1      // スタート → プーラカ
+        case r1ToR2         // プーラカ → レーチャカ
+    }
+    @State private var displayMode: DisplayMode = .none
+
+    // 直近の確定値
     @State private var lastMeasured1: Double?
     @State private var lastMeasured2: Double?
+
+    // 表示用タイマー
+    @State private var now: Date = Date()
+    private let ticker = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                // ===== 大きな操作ボタン =====
+                // ===== 秒数表示領域（常に高さ確保）=====
+                elapsedHeader
+                    .onReceive(ticker) { now = $0 }
+
+                // ===== 操作ボタン =====
                 VStack(spacing: 14) {
 
                     bigButton(
@@ -33,7 +51,7 @@ struct ContentView: View {
                     }
 
                     bigButton(
-                        title: "記録1",
+                        title: "プーラカ",
                         enabled: canRecord1,
                         background: .green
                     ) {
@@ -42,7 +60,7 @@ struct ContentView: View {
                     }
 
                     bigButton(
-                        title: "記録2",
+                        title: "レーチャカ",
                         enabled: canRecord2,
                         background: .orange
                     ) {
@@ -51,13 +69,10 @@ struct ContentView: View {
                     }
                 }
 
-                // ===== 計測結果 =====
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("直近の計測結果")
-                        .font(.headline)
-
-                    resultRow("記録1（スタート→記録1）", lastMeasured1)
-                    resultRow("記録2（記録1→記録2）", lastMeasured2)
+                // ===== シンプルな結果表示 =====
+                VStack(spacing: 8) {
+                    simpleResultRow(title: "プーラカ", value: lastMeasured1)
+                    simpleResultRow(title: "レーチャカ", value: lastMeasured2)
                 }
                 .padding()
                 .background(.thinMaterial)
@@ -77,10 +92,37 @@ struct ContentView: View {
                     }
                 }
                 .listStyle(.insetGrouped)
+
             }
             .padding()
-            .navigationTitle("秒数記録")
         }
+    }
+
+    // MARK: - Header（常にスペース確保）
+
+    private var elapsedHeader: some View {
+        let text = elapsedText()
+        return Text(text)
+            .font(.system(size: 48, weight: .bold, design: .rounded))
+            .monospacedDigit()
+            .foregroundColor(displayMode == .none ? .clear : .blue)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .center)
+    }
+
+    private func elapsedText() -> String {
+        switch displayMode {
+        case .none:
+            return "0.0 秒"   // 高さ確保用
+        case .startToR1:
+            return String(format: "%.1f 秒", elapsedFrom(startDate))
+        case .r1ToR2:
+            return String(format: "%.1f 秒", elapsedFrom(record1Date))
+        }
+    }
+
+    private func elapsedFrom(_ base: Date?) -> Double {
+        guard let base else { return 0.0 }
+        return max(0.0, now.timeIntervalSince(base))
     }
 
     // MARK: - UI Parts
@@ -103,9 +145,10 @@ struct ContentView: View {
         .disabled(!enabled)
     }
 
-    private func resultRow(_ title: String, _ value: Double?) -> some View {
+    private func simpleResultRow(title: String, value: Double?) -> some View {
         HStack {
             Text(title)
+                .font(.headline)
             Spacer()
             Text(formatSeconds(value))
                 .monospacedDigit()
@@ -118,7 +161,7 @@ struct ContentView: View {
             Text(formatDateTime(s.startedAt))
                 .font(.headline)
 
-            Text("記録1: \(formatSeconds(s.record1Seconds))    記録2: \(formatSeconds(s.record2Seconds))")
+            Text("プーラカ: \(formatSeconds(s.record1Seconds))    レーチャカ: \(formatSeconds(s.record2Seconds))")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -126,9 +169,7 @@ struct ContentView: View {
 
     // MARK: - State
 
-    private var isRunning: Bool {
-        currentSession != nil
-    }
+    private var isRunning: Bool { currentSession != nil }
 
     private var canRecord1: Bool {
         isRunning && currentSession?.record1Seconds == nil
@@ -150,22 +191,31 @@ struct ContentView: View {
         currentSession = session
         startDate = startedAt
         record1Date = nil
+
         lastMeasured1 = nil
         lastMeasured2 = nil
+
+        displayMode = .startToR1
+        now = Date()
     }
 
     private func tapRecord1() {
         guard let session = currentSession, let startDate else { return }
+
         let t = Date()
         let seconds = t.timeIntervalSince(startDate)
 
         session.record1Seconds = seconds
-        record1Date = t
         lastMeasured1 = seconds
+
+        record1Date = t
+        displayMode = .r1ToR2
+        now = t
     }
 
     private func tapRecord2() {
         guard let session = currentSession, let record1Date else { return }
+
         let t = Date()
         let seconds = t.timeIntervalSince(record1Date)
 
@@ -173,10 +223,11 @@ struct ContentView: View {
         session.endedAt = t
         lastMeasured2 = seconds
 
-        // セッション終了
         currentSession = nil
         startDate = nil
         self.record1Date = nil
+
+        now = t
     }
 
     private func deleteSessions(at offsets: IndexSet) {
@@ -217,15 +268,14 @@ struct SessionDetailView: View {
             }
 
             Section("記録") {
-                row("記録1（スタート→記録1）", session.record1Seconds)
-                row("記録2（記録1→記録2）", session.record2Seconds)
+                row("プーラカ", session.record1Seconds)
+                row("レーチャカ", session.record2Seconds)
             }
 
             Section("終了") {
                 Text(session.endedAt.map { formatDateTime($0) } ?? "—")
             }
         }
-        .navigationTitle("セッション詳細")
     }
 
     private func row(_ title: String, _ seconds: Double?) -> some View {
