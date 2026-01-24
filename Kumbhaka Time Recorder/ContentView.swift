@@ -1,131 +1,204 @@
 import SwiftUI
 import SwiftData
-import Combine
 import AudioToolbox
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \SessionRecord.startedAt, order: .reverse) private var sessions: [SessionRecord]
 
-    // 進行中セッション
-    @State private var currentSession: SessionRecord?
+    // ===== 安定するまで false =====
+    @State private var isReady = false
 
-    // 計測基準時刻
-    @State private var startDate: Date?
-    @State private var record1Date: Date?
+    // 安定判定用
+    @State private var lastTick: Date = Date()
+    @State private var stableSince: Date? = nil
 
-    // 秒数表示モード
-    private enum DisplayMode {
-        case none
-        case startToR1      // スタート → プーラカ
-        case r1ToR2         // プーラカ → レーチャカ
-    }
-    @State private var displayMode: DisplayMode = .none
+    // チューニング可能
+    private let tickInterval: UInt64 = 100_000_000       // 0.1s
+    private let hangThreshold: TimeInterval = 0.25       // 0.25s を超えたら “固まり”
+    private let requiredStable: TimeInterval = 2.0       // 2秒安定したら ready
 
-    // 直近の確定値
-    @State private var lastMeasured1: Double?
-    @State private var lastMeasured2: Double?
+    // 計測状態（SwiftDataではなくメモリ）
+    private enum Phase { case idle, startToPuraaka, puraakaToRechaka }
+    @State private var phase: Phase = .idle
 
-    // 表示用タイマー
+    @State private var startedAt: Date?
+    @State private var puraakaAt: Date?
+
+    @State private var lastPuraaka: Double?
+    @State private var lastRechaka: Double?
+
+    // 表示更新
     @State private var now: Date = Date()
-    private let ticker = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                // ===== 秒数表示領域（常に高さ確保）=====
                 elapsedHeader
-                    .onReceive(ticker) { now = $0 }
 
-                // ===== 操作ボタン =====
                 VStack(spacing: 14) {
-
                     bigButton(
                         title: "スタート",
-                        enabled: !isRunning,
+                        enabled: isReady && phase == .idle,
                         background: .blue
                     ) {
                         playTapSound()
-                        startSession()
+                        start()
                     }
 
                     bigButton(
                         title: "プーラカ",
-                        enabled: canRecord1,
+                        enabled: isReady && phase == .startToPuraaka,
                         background: .green
                     ) {
                         playTapSound()
-                        tapRecord1()
+                        puraaka()
                     }
 
                     bigButton(
                         title: "レーチャカ",
-                        enabled: canRecord2,
+                        enabled: isReady && phase == .puraakaToRechaka,
                         background: .orange
                     ) {
                         playTapSound()
-                        tapRecord2()
+                        rechakaAndSave()
                     }
                 }
 
-                // ===== シンプルな結果表示 =====
                 VStack(spacing: 8) {
-                    simpleResultRow(title: "プーラカ", value: lastMeasured1)
-                    simpleResultRow(title: "レーチャカ", value: lastMeasured2)
+                    simpleResultRow(title: "プーラカ", value: lastPuraaka)
+                    simpleResultRow(title: "レーチャカ", value: lastRechaka)
                 }
                 .padding()
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
 
-                // ===== 履歴 =====
-                List {
-                    Section("セッション履歴") {
-                        ForEach(sessions) { s in
-                            NavigationLink {
-                                SessionDetailView(session: s)
-                            } label: {
-                                sessionRow(s)
-                            }
-                        }
-                        .onDelete(perform: deleteSessions)
-                    }
+                NavigationLink {
+                    HistoryView()
+                } label: {
+                    Text("履歴を見る")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .background(.thinMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
                 }
-                .listStyle(.insetGrouped)
+                .disabled(!isReady)
+                .opacity(isReady ? 1.0 : 0.6)
 
+                Spacer(minLength: 0)
+
+                if !isReady {
+                    Text("準備中…")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding()
+            .task {
+                // 安定検知ループ
+                lastTick = Date()
+                stableSince = nil
+                isReady = false
+
+                while !Task.isCancelled {
+                    let t = Date()
+                    let dt = t.timeIntervalSince(lastTick)
+                    lastTick = t
+
+                    // now は常に更新（計測中は表示に使う）
+                    now = t
+
+                    // まだ ready でない間だけ安定判定する（ready後は不要）
+                    if !isReady {
+                        if dt > hangThreshold {
+                            // “固まり”が起きた → 安定判定リセット
+                            stableSince = nil
+                        } else {
+                            // 固まりなし
+                            if stableSince == nil { stableSince = t }
+                            if let s = stableSince, t.timeIntervalSince(s) >= requiredStable {
+                                isReady = true
+                            }
+                        }
+                    }
+
+                    try? await Task.sleep(nanoseconds: tickInterval)
+                }
+            }
         }
     }
 
-    // MARK: - Header（常にスペース確保）
+    // MARK: - Header（準備中もスペース確保、readyまで固定）
 
     private var elapsedHeader: some View {
-        let text = elapsedText()
+        // 準備中は “0.0秒” を透明表示で固定してチラつきを抑える
+        let text = isReady ? elapsedText() : "0.0 秒"
+
         return Text(text)
             .font(.system(size: 48, weight: .bold, design: .rounded))
             .monospacedDigit()
-            .foregroundColor(displayMode == .none ? .clear : .blue)
+            .foregroundColor((isReady && phase != .idle) ? .blue : .clear)
             .frame(maxWidth: .infinity, minHeight: 64, alignment: .center)
     }
 
     private func elapsedText() -> String {
-        switch displayMode {
-        case .none:
-            return "0.0 秒"   // 高さ確保用
-        case .startToR1:
-            return String(format: "%.1f 秒", elapsedFrom(startDate))
-        case .r1ToR2:
-            return String(format: "%.1f 秒", elapsedFrom(record1Date))
+        switch phase {
+        case .idle:
+            return "0.0 秒"
+        case .startToPuraaka:
+            return String(format: "%.1f 秒", elapsed(from: startedAt))
+        case .puraakaToRechaka:
+            return String(format: "%.1f 秒", elapsed(from: puraakaAt))
         }
     }
 
-    private func elapsedFrom(_ base: Date?) -> Double {
+    private func elapsed(from base: Date?) -> Double {
         guard let base else { return 0.0 }
         return max(0.0, now.timeIntervalSince(base))
     }
 
-    // MARK: - UI Parts
+    // MARK: - Actions（スタート時にSwiftDataを触らない）
+
+    private func start() {
+        let t = Date()
+        startedAt = t
+        puraakaAt = nil
+        lastPuraaka = nil
+        lastRechaka = nil
+        now = t
+        phase = .startToPuraaka
+    }
+
+    private func puraaka() {
+        guard let startedAt else { return }
+        let t = Date()
+        let sec = t.timeIntervalSince(startedAt)
+        lastPuraaka = sec
+        puraakaAt = t
+        now = t
+        phase = .puraakaToRechaka
+    }
+
+    private func rechakaAndSave() {
+        guard let startedAt, let puraakaAt else { return }
+        let t = Date()
+        let rechakaSec = t.timeIntervalSince(puraakaAt)
+        lastRechaka = rechakaSec
+        now = t
+
+        // 保存は最後に1回だけ
+        let session = SessionRecord(startedAt: startedAt)
+        session.record1Seconds = lastPuraaka
+        session.record2Seconds = lastRechaka
+        session.endedAt = t
+        modelContext.insert(session)
+
+        self.startedAt = nil
+        self.puraakaAt = nil
+        phase = .idle
+    }
+
+    // MARK: - UI
 
     private func bigButton(
         title: String,
@@ -147,8 +220,7 @@ struct ContentView: View {
 
     private func simpleResultRow(title: String, value: Double?) -> some View {
         HStack {
-            Text(title)
-                .font(.headline)
+            Text(title).font(.headline)
             Spacer()
             Text(formatSeconds(value))
                 .monospacedDigit()
@@ -156,105 +228,47 @@ struct ContentView: View {
         }
     }
 
-    private func sessionRow(_ s: SessionRecord) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(formatDateTime(s.startedAt))
-                .font(.headline)
-
-            Text("プーラカ: \(formatSeconds(s.record1Seconds))    レーチャカ: \(formatSeconds(s.record2Seconds))")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - State
-
-    private var isRunning: Bool { currentSession != nil }
-
-    private var canRecord1: Bool {
-        isRunning && currentSession?.record1Seconds == nil
-    }
-
-    private var canRecord2: Bool {
-        isRunning &&
-        currentSession?.record1Seconds != nil &&
-        currentSession?.record2Seconds == nil
-    }
-
-    // MARK: - Actions
-
-    private func startSession() {
-        let startedAt = Date()
-        let session = SessionRecord(startedAt: startedAt)
-        modelContext.insert(session)
-
-        currentSession = session
-        startDate = startedAt
-        record1Date = nil
-
-        lastMeasured1 = nil
-        lastMeasured2 = nil
-
-        displayMode = .startToR1
-        now = Date()
-    }
-
-    private func tapRecord1() {
-        guard let session = currentSession, let startDate else { return }
-
-        let t = Date()
-        let seconds = t.timeIntervalSince(startDate)
-
-        session.record1Seconds = seconds
-        lastMeasured1 = seconds
-
-        record1Date = t
-        displayMode = .r1ToR2
-        now = t
-    }
-
-    private func tapRecord2() {
-        guard let session = currentSession, let record1Date else { return }
-
-        let t = Date()
-        let seconds = t.timeIntervalSince(record1Date)
-
-        session.record2Seconds = seconds
-        session.endedAt = t
-        lastMeasured2 = seconds
-
-        currentSession = nil
-        startDate = nil
-        self.record1Date = nil
-
-        now = t
-    }
-
-    private func deleteSessions(at offsets: IndexSet) {
-        for i in offsets {
-            modelContext.delete(sessions[i])
-        }
-    }
-
-    // MARK: - Sound
-
     private func playTapSound() {
         AudioServicesPlaySystemSound(1104)
     }
-
-    // MARK: - Formatting
 
     private func formatSeconds(_ value: Double?) -> String {
         guard let value else { return "—" }
         return String(format: "%.3f 秒", value)
     }
+}
 
-    private func formatDateTime(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "ja_JP")
-        f.dateStyle = .medium
-        f.timeStyle = .medium
-        return f.string(from: date)
+// MARK: - History（@QueryとListを隔離）
+
+struct HistoryView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \SessionRecord.startedAt, order: .reverse) private var sessions: [SessionRecord]
+
+    var body: some View {
+        List {
+            ForEach(sessions) { s in
+                NavigationLink {
+                    SessionDetailView(session: s)
+                } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(ContentView.df.string(from: s.startedAt))
+                            .font(.headline)
+                        Text("プーラカ: \(fmt(s.record1Seconds))    レーチャカ: \(fmt(s.record2Seconds))")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .onDelete { offsets in
+                for i in offsets { modelContext.delete(sessions[i]) }
+            }
+        }
+        .navigationTitle("履歴")
+    }
+
+    private func fmt(_ v: Double?) -> String {
+        guard let v else { return "—" }
+        return String(format: "%.3f 秒", v)
     }
 }
 
@@ -263,17 +277,13 @@ struct SessionDetailView: View {
 
     var body: some View {
         List {
-            Section("開始") {
-                Text(formatDateTime(session.startedAt))
-            }
-
+            Section("開始") { Text(ContentView.df.string(from: session.startedAt)) }
             Section("記録") {
                 row("プーラカ", session.record1Seconds)
                 row("レーチャカ", session.record2Seconds)
             }
-
             Section("終了") {
-                Text(session.endedAt.map { formatDateTime($0) } ?? "—")
+                Text(session.endedAt.map { ContentView.df.string(from: $0) } ?? "—")
             }
         }
     }
@@ -292,13 +302,15 @@ struct SessionDetailView: View {
         guard let value else { return "—" }
         return String(format: "%.3f 秒", value)
     }
+}
 
-    private func formatDateTime(_ date: Date) -> String {
+// DateFormatter共有
+extension ContentView {
+    static let df: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
         f.dateStyle = .medium
         f.timeStyle = .medium
-        return f.string(from: date)
-    }
+        return f
+    }()
 }
-
