@@ -1,11 +1,5 @@
-//
-//  Kumbhaka_Time_RecorderApp.swift
-//  Kumbhaka Time Recorder
-//
-//  Created by 石居丈怡 on 2026/01/25.
-//
-
 import SwiftUI
+import SwiftData
 
 @main
 struct Kumbhaka_Time_RecorderApp: App {
@@ -13,5 +7,6 @@ struct Kumbhaka_Time_RecorderApp: App {
         WindowGroup {
             ContentView()
         }
+        .modelContainer(for: SessionRecord.self)
     }
 }
