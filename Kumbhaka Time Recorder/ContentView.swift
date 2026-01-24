@@ -5,6 +5,12 @@ import AudioToolbox
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
 
+    // 設定（永続）
+    @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
+    private var rechakaStartMode: RechakaStartMode {
+        RechakaStartMode(rawValue: rechakaStartModeRaw) ?? .auto
+    }
+
     // ===== 安定するまで false =====
     @State private var isReady = false
 
@@ -14,40 +20,92 @@ struct ContentView: View {
 
     // チューニング可能
     private let tickInterval: UInt64 = 100_000_000       // 0.1s
-    private let hangThreshold: TimeInterval = 0.25       // 0.25s を超えたら “固まり”
-    private let requiredStable: TimeInterval = 2.0       // 2秒安定したら ready
+    private let hangThreshold: TimeInterval = 0.25       // 0.25sを超えたら“固まり”
+    private let requiredStable: TimeInterval = 2.0       // 2秒安定でready
 
-    // 計測状態（SwiftDataではなくメモリ）
-    private enum Phase { case idle, startToPuraaka, puraakaToRechaka }
+    // ===== フェーズ =====
+    private enum Phase {
+        case idle                    // 未開始
+        case startToPuraaka          // プーラカ計測中
+        case waitRechakaStart        // （手動）レーチャカ開始待ち
+        case rechakaRunning          // レーチャカ計測中
+    }
     @State private var phase: Phase = .idle
 
+    // ===== 時刻 =====
     @State private var startedAt: Date?
     @State private var puraakaAt: Date?
+    @State private var rechakaAt: Date?
 
+    // ===== 結果 =====
     @State private var lastPuraaka: Double?
     @State private var lastRechaka: Double?
 
     // 表示更新
     @State private var now: Date = Date()
 
+    // MARK: - Button Titles
+
+    // スタートボタン（手動方式では文言を変える）
+    private var startButtonTitle: String {
+        switch rechakaStartMode {
+        case .auto:
+            return "スタート"
+        case .manual:
+            switch phase {
+            case .idle:
+                return "プーラカスタート"
+            case .waitRechakaStart:
+                return "レーチャカスタート"
+            default:
+                return "スタート"
+            }
+        }
+    }
+
+    // ★今回の変更：手動方式のときだけ「ストップ」表記にする
+    private var puraakaButtonTitle: String {
+        (rechakaStartMode == .manual) ? "プーラカストップ" : "プーラカ"
+    }
+
+    private var rechakaButtonTitle: String {
+        (rechakaStartMode == .manual) ? "レーチャカストップ" : "レーチャカ"
+    }
+
+    // MARK: - Start Button Enabled
+
+    private var canTapStart: Bool {
+        switch phase {
+        case .idle:
+            return true
+        case .waitRechakaStart:
+            return true
+        default:
+            return false
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
 
+                // 秒数表示（常に領域確保）
                 elapsedHeader
 
+                // ボタン群
                 VStack(spacing: 14) {
+
                     bigButton(
-                        title: "スタート",
-                        enabled: isReady && phase == .idle,
+                        title: startButtonTitle,
+                        enabled: isReady && canTapStart,
                         background: .blue
                     ) {
                         playTapSound()
-                        start()
+                        handleStartButton()
                     }
 
                     bigButton(
-                        title: "プーラカ",
+                        title: puraakaButtonTitle,
                         enabled: isReady && phase == .startToPuraaka,
                         background: .green
                     ) {
@@ -56,15 +114,16 @@ struct ContentView: View {
                     }
 
                     bigButton(
-                        title: "レーチャカ",
-                        enabled: isReady && phase == .puraakaToRechaka,
+                        title: rechakaButtonTitle,
+                        enabled: isReady && phase == .rechakaRunning,
                         background: .orange
                     ) {
                         playTapSound()
-                        rechakaAndSave()
+                        finishRechakaAndSave()
                     }
                 }
 
+                // 結果（最小表示）
                 VStack(spacing: 8) {
                     simpleResultRow(title: "プーラカ", value: lastPuraaka)
                     simpleResultRow(title: "レーチャカ", value: lastRechaka)
@@ -73,17 +132,32 @@ struct ContentView: View {
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
 
-                NavigationLink {
-                    HistoryView()
-                } label: {
-                    Text("履歴を見る")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity, minHeight: 56)
-                        .background(.thinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                // 履歴 / 設定
+                HStack(spacing: 12) {
+                    NavigationLink {
+                        HistoryView()
+                    } label: {
+                        Text("履歴")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, minHeight: 56)
+                            .background(.thinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                    }
+                    .disabled(!isReady)
+                    .opacity(isReady ? 1.0 : 0.6)
+
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        Text("設定")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, minHeight: 56)
+                            .background(.thinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                    }
+                    .disabled(!isReady)
+                    .opacity(isReady ? 1.0 : 0.6)
                 }
-                .disabled(!isReady)
-                .opacity(isReady ? 1.0 : 0.6)
 
                 Spacer(minLength: 0)
 
@@ -94,50 +168,21 @@ struct ContentView: View {
                 }
             }
             .padding()
-            .task {
-                // 安定検知ループ
-                lastTick = Date()
-                stableSince = nil
-                isReady = false
-
-                while !Task.isCancelled {
-                    let t = Date()
-                    let dt = t.timeIntervalSince(lastTick)
-                    lastTick = t
-
-                    // now は常に更新（計測中は表示に使う）
-                    now = t
-
-                    // まだ ready でない間だけ安定判定する（ready後は不要）
-                    if !isReady {
-                        if dt > hangThreshold {
-                            // “固まり”が起きた → 安定判定リセット
-                            stableSince = nil
-                        } else {
-                            // 固まりなし
-                            if stableSince == nil { stableSince = t }
-                            if let s = stableSince, t.timeIntervalSince(s) >= requiredStable {
-                                isReady = true
-                            }
-                        }
-                    }
-
-                    try? await Task.sleep(nanoseconds: tickInterval)
-                }
-            }
+            .task { await stabilityLoop() }
         }
     }
 
-    // MARK: - Header（準備中もスペース確保、readyまで固定）
+    // MARK: - Header
 
     private var elapsedHeader: some View {
-        // 準備中は “0.0秒” を透明表示で固定してチラつきを抑える
+        // 準備中は固定してチラつきを抑える
         let text = isReady ? elapsedText() : "0.0 秒"
+        let show = isReady && phase != .idle
 
         return Text(text)
             .font(.system(size: 48, weight: .bold, design: .rounded))
             .monospacedDigit()
-            .foregroundColor((isReady && phase != .idle) ? .blue : .clear)
+            .foregroundColor(show ? .blue : .clear)
             .frame(maxWidth: .infinity, minHeight: 64, alignment: .center)
     }
 
@@ -147,8 +192,11 @@ struct ContentView: View {
             return "0.0 秒"
         case .startToPuraaka:
             return String(format: "%.1f 秒", elapsed(from: startedAt))
-        case .puraakaToRechaka:
-            return String(format: "%.1f 秒", elapsed(from: puraakaAt))
+        case .waitRechakaStart:
+            // 待機中は0表示（表示領域は維持）
+            return "0.0 秒"
+        case .rechakaRunning:
+            return String(format: "%.1f 秒", elapsed(from: rechakaAt))
         }
     }
 
@@ -157,12 +205,24 @@ struct ContentView: View {
         return max(0.0, now.timeIntervalSince(base))
     }
 
-    // MARK: - Actions（スタート時にSwiftDataを触らない）
+    // MARK: - Actions
 
-    private func start() {
+    private func handleStartButton() {
+        switch phase {
+        case .idle:
+            startPuraakaPhase()
+        case .waitRechakaStart:
+            startRechakaPhaseManually()
+        default:
+            break
+        }
+    }
+
+    private func startPuraakaPhase() {
         let t = Date()
         startedAt = t
         puraakaAt = nil
+        rechakaAt = nil
         lastPuraaka = nil
         lastRechaka = nil
         now = t
@@ -171,34 +231,88 @@ struct ContentView: View {
 
     private func puraaka() {
         guard let startedAt else { return }
+
         let t = Date()
         let sec = t.timeIntervalSince(startedAt)
+
         lastPuraaka = sec
         puraakaAt = t
         now = t
-        phase = .puraakaToRechaka
+
+        switch rechakaStartMode {
+        case .auto:
+            // 自動：即レーチャカ開始
+            rechakaAt = t
+            phase = .rechakaRunning
+
+        case .manual:
+            // 手動：レーチャカ開始待ち（スタート再有効化）
+            rechakaAt = nil
+            phase = .waitRechakaStart
+        }
     }
 
-    private func rechakaAndSave() {
-        guard let startedAt, let puraakaAt else { return }
+    private func startRechakaPhaseManually() {
+        // 手動モードでのみ到達
         let t = Date()
-        let rechakaSec = t.timeIntervalSince(puraakaAt)
+        rechakaAt = t
+        now = t
+        phase = .rechakaRunning
+    }
+
+    private func finishRechakaAndSave() {
+        guard let startedAt, let puraakaAt, let rechakaAt else { return }
+
+        let t = Date()
+        let rechakaSec = t.timeIntervalSince(rechakaAt)
+
         lastRechaka = rechakaSec
         now = t
 
-        // 保存は最後に1回だけ
+        // 保存（最後に1回だけ）
         let session = SessionRecord(startedAt: startedAt)
         session.record1Seconds = lastPuraaka
         session.record2Seconds = lastRechaka
         session.endedAt = t
         modelContext.insert(session)
 
+        // リセット
         self.startedAt = nil
         self.puraakaAt = nil
+        self.rechakaAt = nil
         phase = .idle
     }
 
-    // MARK: - UI
+    // MARK: - Stability Loop (Ready gating)
+
+    private func stabilityLoop() async {
+        lastTick = Date()
+        stableSince = nil
+        isReady = false
+
+        while !Task.isCancelled {
+            let t = Date()
+            let dt = t.timeIntervalSince(lastTick)
+            lastTick = t
+
+            now = t
+
+            if !isReady {
+                if dt > hangThreshold {
+                    stableSince = nil
+                } else {
+                    if stableSince == nil { stableSince = t }
+                    if let s = stableSince, t.timeIntervalSince(s) >= requiredStable {
+                        isReady = true
+                    }
+                }
+            }
+
+            try? await Task.sleep(nanoseconds: tickInterval)
+        }
+    }
+
+    // MARK: - UI parts
 
     private func bigButton(
         title: String,
@@ -260,7 +374,9 @@ struct HistoryView: View {
                 }
             }
             .onDelete { offsets in
-                for i in offsets { modelContext.delete(sessions[i]) }
+                for i in offsets {
+                    modelContext.delete(sessions[i])
+                }
             }
         }
         .navigationTitle("履歴")
