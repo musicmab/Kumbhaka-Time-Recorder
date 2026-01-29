@@ -1,39 +1,82 @@
+// SettingsView.swift
 import SwiftUI
 
+// ★RechakaStartMode だけここに置く（見つからない問題の対策）
 enum RechakaStartMode: String, CaseIterable, Identifiable {
-    case auto = "auto"       // プーラカ押下で即レーチャカ開始
-    case manual = "manual"   // プーラカ後にスタートを押してレーチャカ開始
+    case auto
+    case manual
 
     var id: String { rawValue }
 
-    var title: String {
+    var label: String {
         switch self {
-        case .auto: return "自動（プーラカで開始）"
-        case .manual: return "手動（再スタートで開始）"
+        case .auto: return "自動"
+        case .manual: return "手動"
         }
     }
 }
 
 struct SettingsView: View {
+    // 計測方式
     @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
+
+    // 表示形式（TimeDisplayStyle は ContentView.swift 等に既に定義済み）
+    @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
+
+    // 目標（秒）と強調色（GoalHighlightColor も既に定義済み）
+    @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0
+    @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
+
+    private let goalFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.minimumFractionDigits = 0
+        f.maximumFractionDigits = 1
+        return f
+    }()
 
     var body: some View {
         Form {
-            Section("レーチャカの開始") {
-                Picker("開始方式", selection: $rechakaStartModeRaw) {
+            Section("計測方式") {
+                Picker("方式", selection: $rechakaStartModeRaw) {
                     ForEach(RechakaStartMode.allCases) { mode in
-                        Text(mode.title).tag(mode.rawValue)
+                        Text(mode.label).tag(mode.rawValue) // Stringで統一
                     }
                 }
-                .pickerStyle(.inline)
+                .pickerStyle(.segmented)
+            }
+
+            Section("表示形式") {
+                Picker("時間の表示", selection: $timeDisplayStyleRaw) {
+                    ForEach(TimeDisplayStyle.allCases) { style in
+                        Text(style.label).tag(style.rawValue) // Stringで統一
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Section("目標") {
+                HStack {
+                    Text("目標（秒）")
+                    Spacer()
+                    TextField("0", value: $goalSeconds, formatter: goalFormatter)
+                        .keyboardType(.decimalPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 120)
+                }
+
+                Picker("達成時の色", selection: $goalColorRaw) {
+                    ForEach(GoalHighlightColor.allCases) { c in
+                        Text(c.label).tag(c.rawValue) // Stringで統一
+                    }
+                }
             }
 
             Section {
-                Text("自動：プーラカを押した瞬間からレーチャカの秒数を計測します。")
-                Text("手動：プーラカ後はいったん停止し、レーチャカスタートを押した瞬間からレーチャカを計測します。")
+                Text("※ 目標（秒）が 0 の場合は、色の強調は無効になります。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
         }
         .navigationTitle("設定")
     }

@@ -1,14 +1,77 @@
+// ContentView.swift
 import SwiftUI
 import SwiftData
 import AudioToolbox
 
+// 表示形式
+enum TimeDisplayStyle: String, CaseIterable, Identifiable {
+    case minuteSecond
+    case decimalSecond
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .minuteSecond: return "何分何秒"
+        case .decimalSecond: return "秒（小数1位）"
+        }
+    }
+}
+
+// 目標達成時の強調色（設定用：必要最低限の選択肢）
+enum GoalHighlightColor: String, CaseIterable, Identifiable {
+    case red
+    case orange
+    case blue
+    case purple
+    case black
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .red: return "赤"
+        case .orange: return "オレンジ"
+        case .blue: return "青"
+        case .purple: return "紫"
+        case .black: return "黒"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .red: return .red
+        case .orange: return .orange
+        case .blue: return .blue
+        case .purple: return .purple
+        case .black: return .black
+        }
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
+
+    // 今日分の履歴（起動時に今日の範囲でQueryを作る）
+    @Query private var todaySessions: [SessionRecord]
 
     // 設定（永続）
     @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
     private var rechakaStartMode: RechakaStartMode {
         RechakaStartMode(rawValue: rechakaStartModeRaw) ?? .auto
+    }
+
+    // 表示形式（デフォルト「何分何秒」）
+    @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
+    private var timeDisplayStyle: TimeDisplayStyle {
+        TimeDisplayStyle(rawValue: timeDisplayStyleRaw) ?? .minuteSecond
+    }
+
+    // ★目標（秒）と強調色（新規）
+    @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0                 // 0=無効扱い
+    @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
+    private var goalColor: Color {
+        (GoalHighlightColor(rawValue: goalColorRaw) ?? .red).color
     }
 
     // ===== 安定するまで false =====
@@ -20,28 +83,41 @@ struct ContentView: View {
     private let hangThreshold: TimeInterval = 0.25
     private let requiredStable: TimeInterval = 2.0
 
-    // ===== フェーズ =====
+    // ===== フェーズ（最初がレーチャカ、次がプーラカ）=====
     private enum Phase {
         case idle
-        case startToPuraaka
-        case waitRechakaStart
-        case rechakaRunning
+        case startToRechaka
+        case waitPuraakaStart
+        case puraakaRunning
     }
     @State private var phase: Phase = .idle
 
     // ===== 時刻 =====
     @State private var startedAt: Date?
-    @State private var puraakaAt: Date?
     @State private var rechakaAt: Date?
+    @State private var puraakaAt: Date?
 
     // ===== 直近完了セッション（共有用） =====
     @State private var lastCompletedStartedAt: Date?
 
-    // ===== 結果 =====
-    @State private var lastPuraaka: Double?
+    // ===== 結果（表示は レーチャカ→プーラカ の順）=====
     @State private var lastRechaka: Double?
+    @State private var lastPuraaka: Double?
 
     @State private var now: Date = Date()
+
+    // MARK: - init（今日の範囲Query）
+    init() {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: Date())
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
+
+        _todaySessions = Query(
+            filter: #Predicate<SessionRecord> { $0.startedAt >= start && $0.startedAt < end },
+            sort: \SessionRecord.startedAt,
+            order: .reverse
+        )
+    }
 
     // MARK: - Button Titles
 
@@ -51,37 +127,40 @@ struct ContentView: View {
             return "スタート"
         case .manual:
             switch phase {
-            case .idle: return "プーラカスタート"
-            case .waitRechakaStart: return "レーチャカスタート"
-            default: return "スタート"
+            case .idle:
+                return "レーチャカスタート"
+            case .waitPuraakaStart:
+                return "プーラカスタート"
+            default:
+                return "スタート"
             }
         }
     }
 
-    private var puraakaButtonTitle: String {
-        rechakaStartMode == .manual ? "プーラカストップ" : "プーラカ"
-    }
-
-    private var rechakaButtonTitle: String {
+    private var rechakaStopButtonTitle: String {
         rechakaStartMode == .manual ? "レーチャカストップ" : "レーチャカ"
     }
 
+    private var puraakaStopButtonTitle: String {
+        rechakaStartMode == .manual ? "プーラカストップ" : "プーラカ"
+    }
+
     private var canTapStart: Bool {
-        phase == .idle || phase == .waitRechakaStart
+        phase == .idle || phase == .waitPuraakaStart
     }
 
     // MARK: - メイン共有（簡易文面）
 
     private var canShareFromMain: Bool {
-        lastCompletedStartedAt != nil && lastPuraaka != nil && lastRechaka != nil
+        lastCompletedStartedAt != nil && lastRechaka != nil && lastPuraaka != nil
     }
 
     private var mainShareText: String {
         let started = lastCompletedStartedAt.map { Self.df.string(from: $0) } ?? "—"
         return """
         開始: \(started)
-        プーラカ: \(formatSeconds(lastPuraaka))
-        レーチャカ: \(formatSeconds(lastRechaka))
+        レーチャカ: \(Self.formatTime(lastRechaka, style: timeDisplayStyle))
+        プーラカ: \(Self.formatTime(lastPuraaka, style: timeDisplayStyle))
         """
     }
 
@@ -106,6 +185,7 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
 
+                // ボタン群（色：レーチャカ=オレンジ、プーラカ=グリーン）
                 VStack(spacing: 14) {
                     bigButton(
                         title: startButtonTitle,
@@ -117,32 +197,37 @@ struct ContentView: View {
                     }
 
                     bigButton(
-                        title: puraakaButtonTitle,
-                        enabled: isReady && phase == .startToPuraaka,
-                        background: .green
-                    ) {
-                        playTapSound()
-                        puraaka()
-                    }
-
-                    bigButton(
-                        title: rechakaButtonTitle,
-                        enabled: isReady && phase == .rechakaRunning,
+                        title: rechakaStopButtonTitle,
+                        enabled: isReady && phase == .startToRechaka,
                         background: .orange
                     ) {
                         playTapSound()
-                        finishRechakaAndSave()
+                        rechakaStop()
+                    }
+
+                    bigButton(
+                        title: puraakaStopButtonTitle,
+                        enabled: isReady && phase == .puraakaRunning,
+                        background: .green
+                    ) {
+                        playTapSound()
+                        finishPuraakaAndSave()
                     }
                 }
 
+                // 直近結果（タイトル太字＋秒数黒＋表示形式設定反映）
                 VStack(spacing: 8) {
-                    simpleResultRow(title: "プーラカ", value: lastPuraaka)
-                    simpleResultRow(title: "レーチャカ", value: lastRechaka)
+                    simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
+                    simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
                 }
                 .padding()
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
 
+                // 今日分の履歴（履歴・設定ボタンの上）
+                todayHistoryPanel
+
+                // 履歴 / 設定
                 HStack(spacing: 12) {
                     NavigationLink("履歴") { HistoryView() }
                         .buttonStyle(.borderedProminent)
@@ -166,7 +251,99 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Header
+    // MARK: - 今日分履歴パネル（目標以上で色変更）
+
+    private var todayHistoryPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("今日の記録")
+                    .font(.headline)
+                    .foregroundColor(.black)
+
+                Spacer()
+
+                Text("\(todaySessions.count)件")
+                    .font(.subheadline)
+                    .foregroundColor(.black)
+            }
+
+            if todaySessions.isEmpty {
+                Text("今日の履歴はありません")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            } else {
+
+                // ヘッダー行
+                HStack {
+                    Text("時間")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.black)
+                        .frame(width: 80, alignment: .center)
+
+                    Spacer().frame(width: 48)
+
+                    Text("レーチャカ")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Text("プーラカ")
+                        .font(.caption.weight(.bold))
+                        .foregroundColor(.green)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.top, 2)
+
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(todaySessions) { s in
+                            let r1 = s.record1Seconds
+                            let r2 = s.record2Seconds
+
+                            HStack {
+                                Text(Self.timeOnly.string(from: s.startedAt))
+                                    .font(.subheadline.weight(.semibold))
+                                    .monospacedDigit()
+                                    .foregroundColor(.black)
+                                    .frame(width: 80, alignment: .center)
+
+                                Spacer().frame(width: 48)
+
+                                // ★目標以上なら色変更（デフォルト赤）
+                                Text(Self.formatTime(r1, style: timeDisplayStyle))
+                                    .font(.subheadline)
+                                    .monospacedDigit()
+                                    .foregroundColor(colorForGoal(r1))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Text(Self.formatTime(r2, style: timeDisplayStyle))
+                                    .font(.subheadline)
+                                    .monospacedDigit()
+                                    .foregroundColor(colorForGoal(r2))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            Divider()
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+                .frame(maxHeight: 170)
+            }
+        }
+        .padding()
+        .background(.thinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func colorForGoal(_ seconds: Double?) -> Color {
+        guard goalSeconds > 0 else { return .black }          // 0以下は無効
+        guard let s = seconds else { return .black }
+        return (s >= goalSeconds) ? goalColor : .black
+    }
+
+    // MARK: - Header（経過表示は従来どおり小数1位秒）
 
     private var elapsedHeader: some View {
         let text = isReady ? elapsedText() : "0.0 秒"
@@ -183,12 +360,12 @@ struct ContentView: View {
         switch phase {
         case .idle:
             return "0.0 秒"
-        case .startToPuraaka:
+        case .startToRechaka:
             return "\(truncate1(elapsed(from: startedAt))) 秒"
-        case .waitRechakaStart:
+        case .waitPuraakaStart:
             return "0.0 秒"
-        case .rechakaRunning:
-            return "\(truncate1(elapsed(from: rechakaAt))) 秒"
+        case .puraakaRunning:
+            return "\(truncate1(elapsed(from: puraakaAt))) 秒"
         }
     }
 
@@ -201,51 +378,60 @@ struct ContentView: View {
 
     private func handleStartButton() {
         if phase == .idle {
-            startPuraakaPhase()
-        } else if phase == .waitRechakaStart {
-            startRechakaPhaseManually()
+            startRechakaPhase()
+        } else if phase == .waitPuraakaStart {
+            startPuraakaPhaseManually()
         }
     }
 
-    private func startPuraakaPhase() {
+    private func startRechakaPhase() {
         let t = Date()
         startedAt = t
-        lastPuraaka = nil
         lastRechaka = nil
+        lastPuraaka = nil
+        rechakaAt = nil
+        puraakaAt = nil
         now = t
-        phase = .startToPuraaka
+        phase = .startToRechaka
     }
 
-    private func puraaka() {
+    // レーチャカ停止（=最初の区間の記録）
+    private func rechakaStop() {
         guard let startedAt else { return }
         let t = Date()
-        lastPuraaka = t.timeIntervalSince(startedAt)
-        puraakaAt = t
+
+        lastRechaka = t.timeIntervalSince(startedAt)
         now = t
 
-        if rechakaStartMode == .auto {
-            rechakaAt = t
-            phase = .rechakaRunning
-        } else {
-            phase = .waitRechakaStart
+        switch rechakaStartMode {
+        case .auto:
+            puraakaAt = t
+            phase = .puraakaRunning
+        case .manual:
+            puraakaAt = nil
+            phase = .waitPuraakaStart
         }
     }
 
-    private func startRechakaPhaseManually() {
+    private func startPuraakaPhaseManually() {
         let t = Date()
-        rechakaAt = t
+        puraakaAt = t
         now = t
-        phase = .rechakaRunning
+        phase = .puraakaRunning
     }
 
-    private func finishRechakaAndSave() {
-        guard let startedAt, let rechakaAt else { return }
+    // プーラカ停止（=2つ目の区間の記録）→ 保存して終了
+    private func finishPuraakaAndSave() {
+        guard let startedAt, let puraakaAt else { return }
         let t = Date()
-        lastRechaka = t.timeIntervalSince(rechakaAt)
 
+        lastPuraaka = t.timeIntervalSince(puraakaAt)
+        now = t
+
+        // 保存（record1=レーチャカ、record2=プーラカ）
         let session = SessionRecord(startedAt: startedAt)
-        session.record1Seconds = lastPuraaka
-        session.record2Seconds = lastRechaka
+        session.record1Seconds = lastRechaka
+        session.record2Seconds = lastPuraaka
         session.endedAt = t
         modelContext.insert(session)
 
@@ -280,18 +466,27 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Formatting（切り捨て小数1桁）
+    // MARK: - Formatting
 
     private func truncate1(_ v: Double) -> String {
         String(format: "%.1f", floor(v * 10) / 10)
     }
 
-    private func formatSeconds(_ v: Double?) -> String {
-        guard let v else { return "—" }
-        return "\(truncate1(v)) 秒"
+    private func simpleResultRow(title: String, value: Double?, titleColor: Color) -> some View {
+        HStack {
+            Text(title)
+                .fontWeight(.bold)
+                .foregroundColor(titleColor)
+            Spacer()
+            Text(Self.formatTime(value, style: timeDisplayStyle))
+                .monospacedDigit()
+                .foregroundColor(.black)
+        }
     }
 
-    // MARK: - UI
+    private func playTapSound() {
+        AudioServicesPlaySystemSound(1104)
+    }
 
     private func bigButton(title: String, enabled: Bool, background: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -304,27 +499,18 @@ struct ContentView: View {
         }
         .disabled(!enabled)
     }
-
-    private func simpleResultRow(title: String, value: Double?) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Text(formatSeconds(value))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func playTapSound() {
-        AudioServicesPlaySystemSound(1104)
-    }
 }
 
-// MARK: - History（日付グループ化＋日付共有：ボタン大型化／開始は時刻のみ／日付下に1行空ける）
+// MARK: - History（表示形式だけ反映）
 
 struct HistoryView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \SessionRecord.startedAt, order: .reverse) private var sessions: [SessionRecord]
+
+    @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
+    private var timeDisplayStyle: TimeDisplayStyle {
+        TimeDisplayStyle(rawValue: timeDisplayStyleRaw) ?? .minuteSecond
+    }
 
     private var groupedDays: [(day: Date, items: [SessionRecord])] {
         let cal = Calendar.current
@@ -345,14 +531,13 @@ struct HistoryView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(ContentView.timeOnly.string(from: s.startedAt))
                                     .font(.headline)
-                                Text("プーラカ: \(fmt(s.record1Seconds)) / レーチャカ: \(fmt(s.record2Seconds))")
+                                Text("レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle)) / プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
 
                             Spacer()
 
-                            // 個別共有（開始は日付込み）
                             ShareLink(item: shareText(for: s)) {
                                 Image(systemName: "square.and.arrow.up")
                                     .font(.title3)
@@ -362,7 +547,6 @@ struct HistoryView: View {
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("この記録を共有")
                         }
                     }
                     .onDelete { offsets in
@@ -378,7 +562,6 @@ struct HistoryView: View {
         .navigationTitle("履歴")
     }
 
-    // セクションヘッダー（共有ボタン大型化）
     private func headerView(for day: Date, items: [SessionRecord]) -> some View {
         HStack(spacing: 12) {
             Text(ContentView.dateOnly.string(from: day))
@@ -399,38 +582,28 @@ struct HistoryView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("この日の履歴を共有")
         }
         .textCase(nil)
         .padding(.vertical, 4)
     }
 
-    // 小数1桁切り捨て表示
-    private func fmt(_ v: Double?) -> String {
-        guard let v else { return "—" }
-        let t = floor(v * 10) / 10
-        return String(format: "%.1f 秒", t)
-    }
-
-    // 個別共有（指定フォーマット：開始は日付＋時刻）
     private func shareText(for s: SessionRecord) -> String {
         """
         開始: \(ContentView.df.string(from: s.startedAt))
-        プーラカ: \(fmt(s.record1Seconds))
-        レーチャカ: \(fmt(s.record2Seconds))
+        レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle))
+        プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))
         """
     }
 
-    // 日付共有（各セッションの「開始」は時刻のみ：日付は省略／日付下に1行空ける）
     private func shareTextForDay(day: Date, sessions: [SessionRecord]) -> String {
         var lines: [String] = []
         lines.append(ContentView.dateOnly.string(from: day))
-        lines.append("") // ★ 日付の下を1行空ける
+        lines.append("")
 
         for s in sessions.sorted(by: { $0.startedAt < $1.startedAt }) {
             lines.append("開始: \(ContentView.timeOnly.string(from: s.startedAt))")
-            lines.append("プーラカ: \(fmt(s.record1Seconds))")
-            lines.append("レーチャカ: \(fmt(s.record2Seconds))")
+            lines.append("レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle))")
+            lines.append("プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))")
             lines.append("")
         }
 
@@ -439,10 +612,9 @@ struct HistoryView: View {
     }
 }
 
-// MARK: - DateFormatter共有
+// MARK: - DateFormatter / 共通フォーマッタ
 
 extension ContentView {
-    // 個別共有は「開始: yyyy/MM/dd H:mm:ss」
     static let df: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
@@ -450,7 +622,6 @@ extension ContentView {
         return f
     }()
 
-    // 履歴セクション用（日付だけ）
     static let dateOnly: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
@@ -458,11 +629,30 @@ extension ContentView {
         return f
     }()
 
-    // 履歴行・日付共有の開始表示用（時刻だけ）
     static let timeOnly: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
         f.dateFormat = "H:mm:ss"
         return f
     }()
+
+    static func formatTime(_ seconds: Double?, style: TimeDisplayStyle) -> String {
+        guard let s = seconds else { return "—" }
+
+        switch style {
+        case .decimalSecond:
+            let v = floor(s * 10) / 10
+            return String(format: "%.1f 秒", v)
+
+        case .minuteSecond:
+            let total = Int(s) // 秒以下は切り捨て
+            let m = total / 60
+            let sec = total % 60
+            if m > 0 {
+                return "\(m)分\(sec)秒"
+            } else {
+                return "\(sec)秒"
+            }
+        }
+    }
 }
