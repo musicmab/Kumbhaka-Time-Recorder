@@ -2,6 +2,7 @@
 import SwiftUI
 import SwiftData
 import AudioToolbox
+import AVFoundation
 
 // 表示形式
 enum TimeDisplayStyle: String, CaseIterable, Identifiable {
@@ -18,7 +19,7 @@ enum TimeDisplayStyle: String, CaseIterable, Identifiable {
     }
 }
 
-// 目標達成時の強調色（設定用：必要最低限の選択肢）
+// 目標達成時の強調色（設定用）
 enum GoalHighlightColor: String, CaseIterable, Identifiable {
     case red
     case orange
@@ -67,19 +68,26 @@ struct ContentView: View {
         TimeDisplayStyle(rawValue: timeDisplayStyleRaw) ?? .minuteSecond
     }
 
-    // ★目標（秒）と強調色（新規）
-    @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0                 // 0=無効扱い
+    // 目標（秒）と強調色
+    @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0
     @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
     private var goalColor: Color {
         (GoalHighlightColor(rawValue: goalColorRaw) ?? .red).color
     }
+
+    // 今日の記録：削除確認用
+    @State private var sessionPendingDelete: SessionRecord? = nil
+    @State private var showDeleteAlert: Bool = false
+
+    // 準備中 点滅用
+    @State private var isPreparingBlink = false
 
     // ===== 安定するまで false =====
     @State private var isReady = false
     @State private var lastTick: Date = Date()
     @State private var stableSince: Date? = nil
 
-    private let tickInterval: UInt64 = 100_000_000
+    private let tickInterval: UInt64 = 100_000_000 // 0.1s
     private let hangThreshold: TimeInterval = 0.25
     private let requiredStable: TimeInterval = 2.0
 
@@ -94,7 +102,6 @@ struct ContentView: View {
 
     // ===== 時刻 =====
     @State private var startedAt: Date?
-    @State private var rechakaAt: Date?
     @State private var puraakaAt: Date?
 
     // ===== 直近完了セッション（共有用） =====
@@ -105,6 +112,16 @@ struct ContentView: View {
     @State private var lastPuraaka: Double?
 
     @State private var now: Date = Date()
+
+    // ===== 10秒ごとのアナウンス =====
+    @State private var lastAnnouncedBucketRechaka: Int = -1
+    @State private var lastAnnouncedBucketPuraaka: Int = -1
+
+    // ✅ 音声の初期化は一度だけ
+    @State private var didPrepareSpeech: Bool = false
+
+    // 読み上げ
+    private let announcer = AVSpeechSynthesizer()
 
     // MARK: - init（今日の範囲Query）
     init() {
@@ -168,21 +185,25 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                // 秒数表示＋共有
-                HStack(spacing: 12) {
+                // ✅ 秒表示（中央固定）＋共有（右端）
+                ZStack {
                     elapsedHeader
+                        .frame(maxWidth: .infinity, alignment: .center)
 
-                    ShareLink(item: mainShareText) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.title3)
-                            .padding(.vertical, 8)
-                            .padding(.horizontal, 10)
-                            .background(.thinMaterial)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .opacity(canShareFromMain ? 1.0 : 0.35)
+                    HStack {
+                        Spacer()
+                        ShareLink(item: mainShareText) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.title3)
+                                .padding(.vertical, 8)
+                                .padding(.horizontal, 10)
+                                .background(.thinMaterial)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .opacity(canShareFromMain ? 1.0 : 0.35)
+                        }
+                        .disabled(!canShareFromMain)
+                        .buttonStyle(.plain)
                     }
-                    .disabled(!canShareFromMain)
-                    .buttonStyle(.plain)
                 }
 
                 // ボタン群（色：レーチャカ=オレンジ、プーラカ=グリーン）
@@ -213,9 +234,29 @@ struct ContentView: View {
                         playTapSound()
                         finishPuraakaAndSave()
                     }
+
+                    // ✅ 準備中（上段のみ、青、ゆっくり点滅）
+                    if !isReady {
+                        Text("準備中")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .opacity(isPreparingBlink ? 0.25 : 1.0)
+                            .padding(.top, 4)
+                            .onAppear {
+                                isPreparingBlink = false
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                                        isPreparingBlink = true
+                                    }
+                                }
+                            }
+                            .onChange(of: isReady) { _, newValue in
+                                if newValue { isPreparingBlink = false }
+                            }
+                    }
                 }
 
-                // 直近結果（タイトル太字＋秒数黒＋表示形式設定反映）
+                // 直近結果（タイトル太字＋秒数黒）
                 VStack(spacing: 8) {
                     simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
                     simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
@@ -224,7 +265,7 @@ struct ContentView: View {
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
 
-                // 今日分の履歴（履歴・設定ボタンの上）
+                // 今日分の履歴
                 todayHistoryPanel
 
                 // 履歴 / 設定
@@ -239,19 +280,13 @@ struct ContentView: View {
                 }
 
                 Spacer()
-
-                if !isReady {
-                    Text("準備中…")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
             }
             .padding()
             .task { await stabilityLoop() }
         }
     }
 
-    // MARK: - 今日分履歴パネル（目標以上で色変更）
+    // MARK: - 今日分履歴パネル（目標以上で色変更 + 個別削除）
 
     private var todayHistoryPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -282,7 +317,7 @@ struct ContentView: View {
                         .foregroundColor(.black)
                         .frame(width: 80, alignment: .center)
 
-                    Spacer().frame(width: 48)
+                    Spacer().frame(width: 24)
 
                     Text("レーチャカ")
                         .font(.caption.weight(.bold))
@@ -293,6 +328,9 @@ struct ContentView: View {
                         .font(.caption.weight(.bold))
                         .foregroundColor(.green)
                         .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Text("")
+                        .frame(width: 36)
                 }
                 .padding(.top, 2)
 
@@ -302,16 +340,15 @@ struct ContentView: View {
                             let r1 = s.record1Seconds
                             let r2 = s.record2Seconds
 
-                            HStack {
+                            HStack(spacing: 10) {
                                 Text(Self.timeOnly.string(from: s.startedAt))
                                     .font(.subheadline.weight(.semibold))
                                     .monospacedDigit()
                                     .foregroundColor(.black)
                                     .frame(width: 80, alignment: .center)
 
-                                Spacer().frame(width: 48)
+                                Spacer().frame(width: 24)
 
-                                // ★目標以上なら色変更（デフォルト赤）
                                 Text(Self.formatTime(r1, style: timeDisplayStyle))
                                     .font(.subheadline)
                                     .monospacedDigit()
@@ -323,7 +360,24 @@ struct ContentView: View {
                                     .monospacedDigit()
                                     .foregroundColor(colorForGoal(r2))
                                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                                // ✅ 個別削除（目立たないグレー）
+                                Button {
+                                    sessionPendingDelete = s
+                                    showDeleteAlert = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.vertical, 6)
+                                        .padding(.horizontal, 8)
+                                        .background(.thinMaterial)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("削除")
                             }
+
                             Divider()
                         }
                     }
@@ -335,15 +389,32 @@ struct ContentView: View {
         .padding()
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 16))
+        .alert("この記録を削除しますか？", isPresented: $showDeleteAlert) {
+            Button("削除", role: .destructive) {
+                if let target = sessionPendingDelete {
+                    modelContext.delete(target)
+                }
+                sessionPendingDelete = nil
+            }
+            Button("キャンセル", role: .cancel) {
+                sessionPendingDelete = nil
+            }
+        } message: {
+            if let target = sessionPendingDelete {
+                Text("\(Self.timeOnly.string(from: target.startedAt)) の記録を削除します。")
+            } else {
+                Text("この記録を削除します。")
+            }
+        }
     }
 
     private func colorForGoal(_ seconds: Double?) -> Color {
-        guard goalSeconds > 0 else { return .black }          // 0以下は無効
+        guard goalSeconds > 0 else { return .black }
         guard let s = seconds else { return .black }
         return (s >= goalSeconds) ? goalColor : .black
     }
 
-    // MARK: - Header（経過表示は従来どおり小数1位秒）
+    // MARK: - Header（経過表示は小数1位秒）
 
     private var elapsedHeader: some View {
         let text = isReady ? elapsedText() : "0.0 秒"
@@ -353,7 +424,7 @@ struct ContentView: View {
             .font(.system(size: 48, weight: .bold, design: .rounded))
             .monospacedDigit()
             .foregroundColor(show ? .blue : .clear)
-            .frame(maxWidth: .infinity, minHeight: 64)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .center)
     }
 
     private func elapsedText() -> String {
@@ -385,42 +456,57 @@ struct ContentView: View {
     }
 
     private func startRechakaPhase() {
+        // ✅ 開始時に音声準備（未実施なら実施）
+        prepareSpeechIfNeeded()
+
         let t = Date()
         startedAt = t
         lastRechaka = nil
         lastPuraaka = nil
-        rechakaAt = nil
         puraakaAt = nil
         now = t
         phase = .startToRechaka
+
+        // 10秒アナウンス（レーチャカ）リセット
+        lastAnnouncedBucketRechaka = -1
+        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
     }
 
-    // レーチャカ停止（=最初の区間の記録）
     private func rechakaStop() {
         guard let startedAt else { return }
         let t = Date()
-
         lastRechaka = t.timeIntervalSince(startedAt)
         now = t
 
         switch rechakaStartMode {
         case .auto:
             puraakaAt = t
+            // 10秒アナウンス（プーラカ）リセット
+            lastAnnouncedBucketPuraaka = -1
+            if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
             phase = .puraakaRunning
+
         case .manual:
             puraakaAt = nil
+            if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
             phase = .waitPuraakaStart
         }
     }
 
     private func startPuraakaPhaseManually() {
+        // ✅ 手動開始でも音声準備（未実施なら実施）
+        prepareSpeechIfNeeded()
+
         let t = Date()
         puraakaAt = t
         now = t
         phase = .puraakaRunning
+
+        // 10秒アナウンス（プーラカ）リセット
+        lastAnnouncedBucketPuraaka = -1
+        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
     }
 
-    // プーラカ停止（=2つ目の区間の記録）→ 保存して終了
     private func finishPuraakaAndSave() {
         guard let startedAt, let puraakaAt else { return }
         let t = Date()
@@ -428,7 +514,6 @@ struct ContentView: View {
         lastPuraaka = t.timeIntervalSince(puraakaAt)
         now = t
 
-        // 保存（record1=レーチャカ、record2=プーラカ）
         let session = SessionRecord(startedAt: startedAt)
         session.record1Seconds = lastRechaka
         session.record2Seconds = lastPuraaka
@@ -436,6 +521,8 @@ struct ContentView: View {
         modelContext.insert(session)
 
         lastCompletedStartedAt = startedAt
+
+        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
         phase = .idle
     }
 
@@ -446,12 +533,16 @@ struct ContentView: View {
         stableSince = nil
         isReady = false
 
+        // ✅ ループ開始前に音声を一度だけ準備（初回スタック対策）
+        prepareSpeechIfNeeded()
+
         while !Task.isCancelled {
             let t = Date()
             let dt = t.timeIntervalSince(lastTick)
             lastTick = t
             now = t
 
+            // 安定判定（isReady更新）
             if !isReady {
                 if dt > hangThreshold {
                     stableSince = nil
@@ -462,11 +553,77 @@ struct ContentView: View {
                     }
                 }
             }
+
+            // 10秒ごとのアナウンス
+            announceIfNeeded()
+
             try? await Task.sleep(nanoseconds: tickInterval)
         }
     }
 
-    // MARK: - Formatting
+    // 10秒跨ぎだけ読み上げ（レーチャカ/プーラカ別カウント）
+    private func announceIfNeeded() {
+        guard isReady else { return }
+
+        switch phase {
+        case .startToRechaka:
+            let seconds = Int(elapsed(from: startedAt))
+            guard seconds > 0, seconds % 10 == 0 else { return }
+            let bucket = seconds / 10
+            guard bucket != lastAnnouncedBucketRechaka else { return }
+            lastAnnouncedBucketRechaka = bucket
+            speak("\(seconds)秒")
+
+        case .puraakaRunning:
+            let seconds = Int(elapsed(from: puraakaAt))
+            guard seconds > 0, seconds % 10 == 0 else { return }
+            let bucket = seconds / 10
+            guard bucket != lastAnnouncedBucketPuraaka else { return }
+            lastAnnouncedBucketPuraaka = bucket
+            speak("\(seconds)秒")
+
+        default:
+            break
+        }
+    }
+
+    // ✅ ここが今回のエラー対策：存在しない関数にならないよう、必ず定義する
+    private func prepareSpeechIfNeeded() {
+        guard !didPrepareSpeech else { return }
+        didPrepareSpeech = true
+        prepareSpeechSession()
+    }
+
+    // 初回の音声遅延を前倒しで解消する（無音ウォームアップ）
+    private func prepareSpeechSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try session.setActive(true)
+
+            // 無音で一度だけ発話して、初回のルーティング確定を済ませる
+            let u = AVSpeechUtterance(string: " ")
+            u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
+            u.volume = 0.0
+            announcer.speak(u)
+        } catch {
+            // print("prepareSpeechSession error: \(error)")
+        }
+    }
+
+    private func speak(_ text: String) {
+        if announcer.isSpeaking {
+            announcer.stopSpeaking(at: .immediate)
+        }
+        let u = AVSpeechUtterance(string: text)
+        u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
+        u.rate = 0.5
+        u.pitchMultiplier = 1.0
+        u.volume = 1.0
+        announcer.speak(u)
+    }
+
+    // MARK: - UI / Formatting
 
     private func truncate1(_ v: Double) -> String {
         String(format: "%.1f", floor(v * 10) / 10)
@@ -498,117 +655,6 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 18))
         }
         .disabled(!enabled)
-    }
-}
-
-// MARK: - History（表示形式だけ反映）
-
-struct HistoryView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query(sort: \SessionRecord.startedAt, order: .reverse) private var sessions: [SessionRecord]
-
-    @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
-    private var timeDisplayStyle: TimeDisplayStyle {
-        TimeDisplayStyle(rawValue: timeDisplayStyleRaw) ?? .minuteSecond
-    }
-
-    private var groupedDays: [(day: Date, items: [SessionRecord])] {
-        let cal = Calendar.current
-        let dict = Dictionary(grouping: sessions) { cal.startOfDay(for: $0.startedAt) }
-        let days = dict.keys.sorted(by: >)
-        return days.map { day in
-            let items = (dict[day] ?? []).sorted { $0.startedAt > $1.startedAt }
-            return (day, items)
-        }
-    }
-
-    var body: some View {
-        List {
-            ForEach(groupedDays, id: \.day) { section in
-                Section {
-                    ForEach(section.items) { s in
-                        HStack(alignment: .firstTextBaseline, spacing: 12) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(ContentView.timeOnly.string(from: s.startedAt))
-                                    .font(.headline)
-                                Text("レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle)) / プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Spacer()
-
-                            ShareLink(item: shareText(for: s)) {
-                                Image(systemName: "square.and.arrow.up")
-                                    .font(.title3)
-                                    .padding(.vertical, 6)
-                                    .padding(.horizontal, 10)
-                                    .background(.thinMaterial)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .onDelete { offsets in
-                        for i in offsets {
-                            modelContext.delete(section.items[i])
-                        }
-                    }
-                } header: {
-                    headerView(for: section.day, items: section.items)
-                }
-            }
-        }
-        .navigationTitle("履歴")
-    }
-
-    private func headerView(for day: Date, items: [SessionRecord]) -> some View {
-        HStack(spacing: 12) {
-            Text(ContentView.dateOnly.string(from: day))
-                .font(.headline)
-
-            Spacer()
-
-            ShareLink(item: shareTextForDay(day: day, sessions: items)) {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.headline)
-                    Text("この日を共有")
-                        .font(.headline)
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 12)
-                .background(.thinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-            .buttonStyle(.plain)
-        }
-        .textCase(nil)
-        .padding(.vertical, 4)
-    }
-
-    private func shareText(for s: SessionRecord) -> String {
-        """
-        開始: \(ContentView.df.string(from: s.startedAt))
-        レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle))
-        プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))
-        """
-    }
-
-    private func shareTextForDay(day: Date, sessions: [SessionRecord]) -> String {
-        var lines: [String] = []
-        lines.append(ContentView.dateOnly.string(from: day))
-        lines.append("")
-
-        for s in sessions.sorted(by: { $0.startedAt < $1.startedAt }) {
-            lines.append("開始: \(ContentView.timeOnly.string(from: s.startedAt))")
-            lines.append("レーチャカ: \(ContentView.formatTime(s.record1Seconds, style: timeDisplayStyle))")
-            lines.append("プーラカ: \(ContentView.formatTime(s.record2Seconds, style: timeDisplayStyle))")
-            lines.append("")
-        }
-
-        while lines.last == "" { lines.removeLast() }
-        return lines.joined(separator: "\n")
     }
 }
 
