@@ -53,8 +53,8 @@ enum GoalHighlightColor: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
 
-    // 今日分の履歴（起動時に今日の範囲でQueryを作る）
-    @Query private var todaySessions: [SessionRecord]
+    // ✅ 今日分の履歴（自前で fetch）
+    @State private var todaySessions: [SessionRecord] = []
 
     // 設定（永続）
     @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
@@ -62,7 +62,7 @@ struct ContentView: View {
         RechakaStartMode(rawValue: rechakaStartModeRaw) ?? .auto
     }
 
-    // 表示形式（デフォルト「何分何秒」）
+    // 表示形式
     @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
     private var timeDisplayStyle: TimeDisplayStyle {
         TimeDisplayStyle(rawValue: timeDisplayStyleRaw) ?? .minuteSecond
@@ -117,27 +117,25 @@ struct ContentView: View {
     @State private var lastAnnouncedBucketRechaka: Int = -1
     @State private var lastAnnouncedBucketPuraaka: Int = -1
 
-    // ✅ 音声の初期化は一度だけ
+    // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
+
+    // ✅ 日付跨ぎ監視タスク
+    @State private var midnightTask: Task<Void, Never>? = nil
 
     // 読み上げ
     private let announcer = AVSpeechSynthesizer()
 
-    // MARK: - init（今日の範囲Query）
-    init() {
-        let cal = Calendar.current
-        let start = cal.startOfDay(for: Date())
-        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
-
-        _todaySessions = Query(
-            filter: #Predicate<SessionRecord> { $0.startedAt >= start && $0.startedAt < end },
-            sort: \SessionRecord.startedAt,
-            order: .reverse
-        )
+    // MARK: - 目標達成回数（今日・レーチャカのみ）
+    private var goalAchievedCountToday: Int {
+        guard goalSeconds > 0 else { return 0 }
+        return todaySessions.reduce(0) { acc, s in
+            let r1 = s.record1Seconds ?? 0
+            return acc + ((r1 >= goalSeconds) ? 1 : 0)
+        }
     }
 
     // MARK: - Button Titles
-
     private var startButtonTitle: String {
         switch rechakaStartMode {
         case .auto:
@@ -167,7 +165,6 @@ struct ContentView: View {
     }
 
     // MARK: - メイン共有（簡易文面）
-
     private var canShareFromMain: Bool {
         lastCompletedStartedAt != nil && lastRechaka != nil && lastPuraaka != nil
     }
@@ -185,7 +182,7 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                // ✅ 秒表示（中央固定）＋共有（右端）
+                // ✅ 秒表示（画面中央固定）＋共有（右端）
                 ZStack {
                     elapsedHeader
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -206,7 +203,7 @@ struct ContentView: View {
                     }
                 }
 
-                // ボタン群（色：レーチャカ=オレンジ、プーラカ=グリーン）
+                // ボタン群
                 VStack(spacing: 14) {
                     bigButton(
                         title: startButtonTitle,
@@ -256,7 +253,7 @@ struct ContentView: View {
                     }
                 }
 
-                // 直近結果（タイトル太字＋秒数黒）
+                // 直近結果
                 VStack(spacing: 8) {
                     simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
                     simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
@@ -282,24 +279,93 @@ struct ContentView: View {
                 Spacer()
             }
             .padding()
-            .task { await stabilityLoop() }
+            .task {
+                // 起動時に今日分を取得
+                await MainActor.run { fetchTodaySessions() }
+
+                // 日付跨ぎ監視（多重起動防止）
+                midnightTask?.cancel()
+                midnightTask = Task { await startMidnightWatcher() }
+
+                // 安定化ループ
+                await stabilityLoop()
+            }
+            .onDisappear {
+                midnightTask?.cancel()
+                midnightTask = nil
+            }
         }
     }
 
-    // MARK: - 今日分履歴パネル（目標以上で色変更 + 個別削除）
+    // MARK: - 今日分の取得（日付跨ぎ対応）
+
+    @MainActor
+    private func fetchTodaySessions() {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: Date())
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
+
+        let predicate = #Predicate<SessionRecord> { s in
+            s.startedAt >= start && s.startedAt < end
+        }
+
+        let desc = FetchDescriptor<SessionRecord>(
+            predicate: predicate,
+            sortBy: [SortDescriptor(\.startedAt, order: .reverse)]
+        )
+
+        do {
+            todaySessions = try modelContext.fetch(desc)
+        } catch {
+            todaySessions = []
+        }
+    }
+
+    private func startMidnightWatcher() async {
+        while !Task.isCancelled {
+            let cal = Calendar.current
+            let now = Date()
+            let tomorrowStart = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now))!
+            let seconds = tomorrowStart.timeIntervalSince(now)
+
+            let ns = UInt64(max(1, seconds) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: ns)
+
+            await MainActor.run {
+                fetchTodaySessions()
+            }
+        }
+    }
+
+    // MARK: - 今日分履歴パネル（均等ヘッダー + 目標達成回数）
 
     private var todayHistoryPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
+
+            // ✅ ここが「均等に開ける」ヘッダー
             HStack {
+                // 左
                 Text("今日の記録")
                     .font(.headline)
                     .foregroundColor(.black)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer()
-
+                // 中央
                 Text("\(todaySessions.count)件")
                     .font(.subheadline)
                     .foregroundColor(.black)
+                    .frame(maxWidth: .infinity, alignment: .center)
+
+                // 右（目標設定時のみ表示、未設定時はダミーで幅を揃える）
+                if goalSeconds > 0 {
+                    Text("目標達成 \(goalAchievedCountToday)回")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                } else {
+                    Color.clear
+                        .frame(maxWidth: .infinity)
+                }
             }
 
             if todaySessions.isEmpty {
@@ -395,6 +461,7 @@ struct ContentView: View {
                     modelContext.delete(target)
                 }
                 sessionPendingDelete = nil
+                fetchTodaySessions()
             }
             Button("キャンセル", role: .cancel) {
                 sessionPendingDelete = nil
@@ -456,7 +523,6 @@ struct ContentView: View {
     }
 
     private func startRechakaPhase() {
-        // ✅ 開始時に音声準備（未実施なら実施）
         prepareSpeechIfNeeded()
 
         let t = Date()
@@ -467,7 +533,6 @@ struct ContentView: View {
         now = t
         phase = .startToRechaka
 
-        // 10秒アナウンス（レーチャカ）リセット
         lastAnnouncedBucketRechaka = -1
         if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
     }
@@ -481,7 +546,6 @@ struct ContentView: View {
         switch rechakaStartMode {
         case .auto:
             puraakaAt = t
-            // 10秒アナウンス（プーラカ）リセット
             lastAnnouncedBucketPuraaka = -1
             if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
             phase = .puraakaRunning
@@ -494,7 +558,6 @@ struct ContentView: View {
     }
 
     private func startPuraakaPhaseManually() {
-        // ✅ 手動開始でも音声準備（未実施なら実施）
         prepareSpeechIfNeeded()
 
         let t = Date()
@@ -502,7 +565,6 @@ struct ContentView: View {
         now = t
         phase = .puraakaRunning
 
-        // 10秒アナウンス（プーラカ）リセット
         lastAnnouncedBucketPuraaka = -1
         if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
     }
@@ -524,6 +586,9 @@ struct ContentView: View {
 
         if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
         phase = .idle
+
+        // ✅ 保存後に今日分を再取得（即時反映）
+        fetchTodaySessions()
     }
 
     // MARK: - Stability
@@ -533,7 +598,7 @@ struct ContentView: View {
         stableSince = nil
         isReady = false
 
-        // ✅ ループ開始前に音声を一度だけ準備（初回スタック対策）
+        // ✅ 初回スタック対策：ループ開始前に音声を一度だけ準備
         prepareSpeechIfNeeded()
 
         while !Task.isCancelled {
@@ -542,7 +607,6 @@ struct ContentView: View {
             lastTick = t
             now = t
 
-            // 安定判定（isReady更新）
             if !isReady {
                 if dt > hangThreshold {
                     stableSince = nil
@@ -554,7 +618,6 @@ struct ContentView: View {
                 }
             }
 
-            // 10秒ごとのアナウンス
             announceIfNeeded()
 
             try? await Task.sleep(nanoseconds: tickInterval)
@@ -587,7 +650,6 @@ struct ContentView: View {
         }
     }
 
-    // ✅ ここが今回のエラー対策：存在しない関数にならないよう、必ず定義する
     private func prepareSpeechIfNeeded() {
         guard !didPrepareSpeech else { return }
         didPrepareSpeech = true
@@ -601,7 +663,6 @@ struct ContentView: View {
             try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
             try session.setActive(true)
 
-            // 無音で一度だけ発話して、初回のルーティング確定を済ませる
             let u = AVSpeechUtterance(string: " ")
             u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
             u.volume = 0.0
@@ -665,13 +726,6 @@ extension ContentView {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
         f.dateFormat = "yyyy/MM/dd H:mm:ss"
-        return f
-    }()
-
-    static let dateOnly: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "ja_JP")
-        f.dateFormat = "yyyy/MM/dd"
         return f
     }()
 
