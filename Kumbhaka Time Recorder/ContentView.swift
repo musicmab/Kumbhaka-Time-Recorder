@@ -53,7 +53,7 @@ enum GoalHighlightColor: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
 
-    // ✅ 今日分の履歴（自前で fetch）
+    // ✅ 今日分の履歴（自前 fetch）
     @State private var todaySessions: [SessionRecord] = []
 
     // 設定（永続）
@@ -75,11 +75,11 @@ struct ContentView: View {
         (GoalHighlightColor(rawValue: goalColorRaw) ?? .red).color
     }
 
-    // 今日の記録：削除確認用
+    // 今日の記録：削除確認
     @State private var sessionPendingDelete: SessionRecord? = nil
     @State private var showDeleteAlert: Bool = false
 
-    // 準備中 点滅用
+    // 準備中 点滅
     @State private var isPreparingBlink = false
 
     // ===== 安定するまで false =====
@@ -91,7 +91,7 @@ struct ContentView: View {
     private let hangThreshold: TimeInterval = 0.25
     private let requiredStable: TimeInterval = 2.0
 
-    // ===== フェーズ（最初がレーチャカ、次がプーラカ）=====
+    // ===== フェーズ =====
     private enum Phase {
         case idle
         case startToRechaka
@@ -107,7 +107,7 @@ struct ContentView: View {
     // ===== 直近完了セッション（共有用） =====
     @State private var lastCompletedStartedAt: Date?
 
-    // ===== 結果（表示は レーチャカ→プーラカ の順）=====
+    // ===== 結果（表示は レーチャカ→プーラカ）=====
     @State private var lastRechaka: Double?
     @State private var lastPuraaka: Double?
 
@@ -119,12 +119,10 @@ struct ContentView: View {
 
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
+    private let announcer = AVSpeechSynthesizer()
 
     // ✅ 日付跨ぎ監視タスク
     @State private var midnightTask: Task<Void, Never>? = nil
-
-    // 読み上げ
-    private let announcer = AVSpeechSynthesizer()
 
     // MARK: - 目標達成回数（今日・レーチャカのみ）
     private var goalAchievedCountToday: Int {
@@ -136,6 +134,7 @@ struct ContentView: View {
     }
 
     // MARK: - Button Titles
+
     private var startButtonTitle: String {
         switch rechakaStartMode {
         case .auto:
@@ -164,7 +163,8 @@ struct ContentView: View {
         phase == .idle || phase == .waitPuraakaStart
     }
 
-    // MARK: - メイン共有（簡易文面）
+    // MARK: - メイン共有
+
     private var canShareFromMain: Bool {
         lastCompletedStartedAt != nil && lastRechaka != nil && lastPuraaka != nil
     }
@@ -182,7 +182,7 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 24) {
 
-                // ✅ 秒表示（画面中央固定）＋共有（右端）
+                // ✅ 秒表示は画面中央固定／共有は右端
                 ZStack {
                     elapsedHeader
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -337,32 +337,30 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 今日分履歴パネル（均等ヘッダー + 目標達成回数）
+    // MARK: - 今日分履歴パネル（均等ヘッダー + 目標達成回数 + 個別削除）
 
     private var todayHistoryPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
 
-            // ✅ ここが「均等に開ける」ヘッダー
+            // ✅ 「今日の記録」「件数」「目標達成回数」を均等配置
             HStack {
-                // 左
                 Text("今日の記録")
                     .font(.headline)
                     .foregroundColor(.black)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                // 中央
                 Text("\(todaySessions.count)件")
                     .font(.subheadline)
                     .foregroundColor(.black)
                     .frame(maxWidth: .infinity, alignment: .center)
 
-                // 右（目標設定時のみ表示、未設定時はダミーで幅を揃える）
                 if goalSeconds > 0 {
                     Text("目標達成 \(goalAchievedCountToday)回")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 } else {
+                    // 目標未設定でも幅を揃える
                     Color.clear
                         .frame(maxWidth: .infinity)
                 }
@@ -598,7 +596,7 @@ struct ContentView: View {
         stableSince = nil
         isReady = false
 
-        // ✅ 初回スタック対策：ループ開始前に音声を一度だけ準備
+        // ✅ 初回の音声遅延対策（ウォームアップ）
         prepareSpeechIfNeeded()
 
         while !Task.isCancelled {
@@ -624,7 +622,7 @@ struct ContentView: View {
         }
     }
 
-    // 10秒跨ぎだけ読み上げ（レーチャカ/プーラカ別カウント）
+    // 10秒ごとの読み上げ（レーチャカ/プーラカ別カウント）
     private func announceIfNeeded() {
         guard isReady else { return }
 
@@ -656,7 +654,7 @@ struct ContentView: View {
         prepareSpeechSession()
     }
 
-    // 初回の音声遅延を前倒しで解消する（無音ウォームアップ）
+    // 初回の音声遅延を前倒しで解消（無音ウォームアップ）
     private func prepareSpeechSession() {
         let session = AVAudioSession.sharedInstance()
         do {
@@ -719,13 +717,20 @@ struct ContentView: View {
     }
 }
 
-// MARK: - DateFormatter / 共通フォーマッタ
+// MARK: - DateFormatter / 共通フォーマッタ（HistoryView が参照する dateOnly を必ず含める）
 
 extension ContentView {
     static let df: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
         f.dateFormat = "yyyy/MM/dd H:mm:ss"
+        return f
+    }()
+
+    static let dateOnly: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.dateFormat = "yyyy/MM/dd"
         return f
     }()
 
