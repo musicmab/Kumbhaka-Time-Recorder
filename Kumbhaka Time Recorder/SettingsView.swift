@@ -1,5 +1,6 @@
 // SettingsView.swift
 import SwiftUI
+import SwiftData
 
 // ★RechakaStartMode だけここに置く（見つからない問題の対策）
 enum RechakaStartMode: String, CaseIterable, Identifiable {
@@ -25,7 +26,10 @@ struct SettingsView: View {
 
     // 目標（秒）と強調色（GoalHighlightColor も既に定義済み）
     @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0
+    @AppStorage("goalAutoEnabled") private var goalAutoEnabled: Bool = true
     @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
+
+    @Query(sort: \SessionRecord.startedAt, order: .reverse) private var sessions: [SessionRecord]
 
     private let goalFormatter: NumberFormatter = {
         let f = NumberFormatter()
@@ -56,6 +60,11 @@ struct SettingsView: View {
             }
 
             Section("目標") {
+                Toggle("自動で設定", isOn: $goalAutoEnabled)
+                    .onChange(of: goalAutoEnabled) { _, _ in
+                        refreshAutoGoalIfNeeded()
+                    }
+
                 HStack {
                     Text("目標（秒）")
                     Spacer()
@@ -63,6 +72,7 @@ struct SettingsView: View {
                         .keyboardType(.decimalPad)
                         .multilineTextAlignment(.trailing)
                         .frame(width: 120)
+                        .disabled(goalAutoEnabled)
                 }
 
                 Picker("達成時の色", selection: $goalColorRaw) {
@@ -79,5 +89,33 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("設定")
+        .onAppear {
+            refreshAutoGoalIfNeeded()
+        }
+        .onChange(of: sessions) { _, _ in
+            refreshAutoGoalIfNeeded()
+        }
+    }
+
+    private func refreshAutoGoalIfNeeded() {
+        guard goalAutoEnabled else { return }
+        let newGoal = calculateAutoGoalSeconds()
+        if abs(goalSeconds - newGoal) > 0.01 {
+            goalSeconds = newGoal
+        }
+    }
+
+    private func calculateAutoGoalSeconds() -> Double {
+        let calendar = Calendar.current
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+        let puraakaTimes = sessions.compactMap { session -> Double? in
+            guard session.startedAt >= weekAgo else { return nil }
+            return session.record2Seconds
+        }
+        let sortedTimes = puraakaTimes.sorted(by: >)
+        let topTimes = sortedTimes.prefix(10)
+        guard !topTimes.isEmpty else { return 0.0 }
+        let total = topTimes.reduce(0.0, +)
+        return total / Double(topTimes.count)
     }
 }
