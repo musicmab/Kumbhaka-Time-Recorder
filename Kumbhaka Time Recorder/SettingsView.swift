@@ -134,12 +134,12 @@ struct SettingsView: View {
         let calendar = Calendar.current
         let now = Date()
         let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) ?? now
-        let puraakaTimes = sessions.compactMap { session -> Double? in
+        let rechakaTimes = sessions.compactMap { session -> Double? in
             guard session.startedAt >= monthAgo, session.startedAt <= now else { return nil }
-            guard let seconds = session.record2Seconds, seconds > 0 else { return nil }
+            guard let seconds = session.record1Seconds, seconds > 0 else { return nil }
             return seconds
         }
-        let sortedTimes = puraakaTimes.sorted(by: >)
+        let sortedTimes = rechakaTimes.sorted(by: >)
         let topTimes = sortedTimes.prefix(10)
         guard !topTimes.isEmpty else { return 0.0 }
         let total = topTimes.reduce(0.0, +)
