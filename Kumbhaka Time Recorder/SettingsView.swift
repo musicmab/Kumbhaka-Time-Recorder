@@ -123,23 +123,14 @@ struct SettingsView: View {
         }
     }
 
-    private func updateManualGoalIfNeeded() {
-        guard !goalAutoEnabled else { return }
-        if abs(goalManualSeconds - goalSeconds) > 0.01 {
-            goalManualSeconds = goalSeconds
-        }
-    }
-
     private func calculateAutoGoalSeconds() -> Double {
         let calendar = Calendar.current
-        let now = Date()
-        let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) ?? now
-        let rechakaTimes = sessions.compactMap { session -> Double? in
-            guard session.startedAt >= monthAgo, session.startedAt <= now else { return nil }
-            guard let seconds = session.record1Seconds, seconds > 0 else { return nil }
-            return seconds
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+        let puraakaTimes = sessions.compactMap { session -> Double? in
+            guard session.startedAt >= weekAgo else { return nil }
+            return session.record2Seconds
         }
-        let sortedTimes = rechakaTimes.sorted(by: >)
+        let sortedTimes = puraakaTimes.sorted(by: >)
         let topTimes = sortedTimes.prefix(10)
         guard !topTimes.isEmpty else { return 0.0 }
         let total = topTimes.reduce(0.0, +)
