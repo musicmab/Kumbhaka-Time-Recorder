@@ -26,6 +26,7 @@ struct SettingsView: View {
 
     // 目標（秒）と強調色（GoalHighlightColor も既に定義済み）
     @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0
+    @AppStorage("goalManualSeconds") private var goalManualSeconds: Double = 0.0
     @AppStorage("goalAutoEnabled") private var goalAutoEnabled: Bool = true
     @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
 
@@ -61,8 +62,8 @@ struct SettingsView: View {
 
             Section("目標") {
                 Toggle("自動で設定", isOn: $goalAutoEnabled)
-                    .onChange(of: goalAutoEnabled) { _, _ in
-                        refreshAutoGoalIfNeeded()
+                    .onChange(of: goalAutoEnabled) { oldValue, newValue in
+                        handleGoalModeChange(from: oldValue, to: newValue)
                     }
 
                 HStack {
@@ -73,6 +74,9 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .frame(width: 120)
                         .disabled(goalAutoEnabled)
+                        .onChange(of: goalSeconds) { _, _ in
+                            updateManualGoalIfNeeded()
+                        }
                 }
 
                 Picker("達成時の色", selection: $goalColorRaw) {
@@ -90,10 +94,24 @@ struct SettingsView: View {
         }
         .navigationTitle("設定")
         .onAppear {
-            refreshAutoGoalIfNeeded()
+            if goalAutoEnabled {
+                refreshAutoGoalIfNeeded()
+            } else {
+                goalSeconds = goalManualSeconds
+            }
         }
         .onChange(of: sessions) { _, _ in
             refreshAutoGoalIfNeeded()
+        }
+    }
+
+    private func handleGoalModeChange(from oldValue: Bool, to newValue: Bool) {
+        guard oldValue != newValue else { return }
+        if newValue {
+            goalManualSeconds = goalSeconds
+            refreshAutoGoalIfNeeded()
+        } else {
+            goalSeconds = goalManualSeconds
         }
     }
 
@@ -105,14 +123,23 @@ struct SettingsView: View {
         }
     }
 
+    private func updateManualGoalIfNeeded() {
+        guard !goalAutoEnabled else { return }
+        if abs(goalManualSeconds - goalSeconds) > 0.01 {
+            goalManualSeconds = goalSeconds
+        }
+    }
+
     private func calculateAutoGoalSeconds() -> Double {
         let calendar = Calendar.current
-        let weekAgo = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
-        let puraakaTimes = sessions.compactMap { session -> Double? in
-            guard session.startedAt >= weekAgo else { return nil }
-            return session.record2Seconds
+        let now = Date()
+        let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) ?? now
+        let rechakaTimes = sessions.compactMap { session -> Double? in
+            guard session.startedAt >= monthAgo, session.startedAt <= now else { return nil }
+            guard let seconds = session.record1Seconds, seconds > 0 else { return nil }
+            return seconds
         }
-        let sortedTimes = puraakaTimes.sorted(by: >)
+        let sortedTimes = rechakaTimes.sorted(by: >)
         let topTimes = sortedTimes.prefix(10)
         guard !topTimes.isEmpty else { return 0.0 }
         let total = topTimes.reduce(0.0, +)
