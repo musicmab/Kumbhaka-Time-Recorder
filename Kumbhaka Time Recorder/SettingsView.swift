@@ -26,7 +26,6 @@ struct SettingsView: View {
 
     // 目標（秒）と強調色（GoalHighlightColor も既に定義済み）
     @AppStorage("goalSeconds") private var goalSeconds: Double = 0.0
-    @AppStorage("goalManualSeconds") private var goalManualSeconds: Double = 0.0
     @AppStorage("goalAutoEnabled") private var goalAutoEnabled: Bool = true
     @AppStorage("goalHighlightColor") private var goalColorRaw: String = GoalHighlightColor.red.rawValue
 
@@ -62,8 +61,8 @@ struct SettingsView: View {
 
             Section("目標") {
                 Toggle("自動で設定", isOn: $goalAutoEnabled)
-                    .onChange(of: goalAutoEnabled) { oldValue, newValue in
-                        handleGoalModeChange(from: oldValue, to: newValue)
+                    .onChange(of: goalAutoEnabled) { _, _ in
+                        refreshAutoGoalIfNeeded()
                     }
 
                 HStack {
@@ -74,9 +73,6 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .frame(width: 120)
                         .disabled(goalAutoEnabled)
-                        .onChange(of: goalSeconds) { _, _ in
-                            updateManualGoalIfNeeded()
-                        }
                 }
 
                 Picker("達成時の色", selection: $goalColorRaw) {
@@ -94,24 +90,10 @@ struct SettingsView: View {
         }
         .navigationTitle("設定")
         .onAppear {
-            if goalAutoEnabled {
-                refreshAutoGoalIfNeeded()
-            } else {
-                goalSeconds = goalManualSeconds
-            }
+            refreshAutoGoalIfNeeded()
         }
         .onChange(of: sessions) { _, _ in
             refreshAutoGoalIfNeeded()
-        }
-    }
-
-    private func handleGoalModeChange(from oldValue: Bool, to newValue: Bool) {
-        guard oldValue != newValue else { return }
-        if newValue {
-            goalManualSeconds = goalSeconds
-            refreshAutoGoalIfNeeded()
-        } else {
-            goalSeconds = goalManualSeconds
         }
     }
 
