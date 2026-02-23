@@ -47,6 +47,7 @@ struct SettingsView: View {
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
     @AppStorage("speechRate") private var speechRate: Double = 0.5
     @AppStorage("speechPitch") private var speechPitch: Double = 1.0
+    @AppStorage("speechVolume") private var speechVolume: Double = 1.0
     @AppStorage("speechPronunciationMap") private var speechPronunciationMap: String = ""
     @AppStorage("speechEnableRechakaStart") private var speechEnableRechakaStart: Bool = true
     @AppStorage("speechEnableRechakaStop") private var speechEnableRechakaStop: Bool = true
@@ -150,6 +151,15 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Slider(value: $speechPitch, in: 0.70...1.40, step: 0.01)
+
+                HStack {
+                    Text("読み上げ音量")
+                    Spacer()
+                    Text(String(format: "%.2f", speechVolume))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $speechVolume, in: 0.0...1.0, step: 0.05)
 
                 Text("読み分け辞書（1行ごとに 単語=読み）")
                     .font(.footnote)
@@ -268,7 +278,7 @@ struct SettingsView: View {
         utterance.voice = AVSpeechSynthesisVoice(language: "ja-JP")
         utterance.rate = Float(min(0.65, max(0.30, speechRate)))
         utterance.pitchMultiplier = Float(min(1.40, max(0.70, speechPitch)))
-        utterance.volume = 1.0
+        utterance.volume = Float(min(1.0, max(0.0, speechVolume)))
         SpeechPreviewPlayer.shared.play(utterance)
     }
 

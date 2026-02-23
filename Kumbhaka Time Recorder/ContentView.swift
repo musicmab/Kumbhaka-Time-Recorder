@@ -177,6 +177,7 @@ struct ContentView: View {
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
     @AppStorage("speechRate") private var speechRate: Double = 0.5
     @AppStorage("speechPitch") private var speechPitch: Double = 1.0
+    @AppStorage("speechVolume") private var speechVolume: Double = 1.0
     @AppStorage("speechPronunciationMap") private var speechPronunciationMap: String = ""
     @AppStorage("speechEnableRechakaStart") private var speechEnableRechakaStart: Bool = true
     @AppStorage("speechEnableRechakaStop") private var speechEnableRechakaStop: Bool = true
@@ -966,7 +967,7 @@ struct ContentView: View {
         u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
         u.rate = Float(min(0.65, max(0.30, speechRate)))
         u.pitchMultiplier = Float(min(1.40, max(0.70, speechPitch)))
-        u.volume = 1.0
+        u.volume = Float(min(1.0, max(0.0, speechVolume)))
         announcer.speak(u)
     }
 
