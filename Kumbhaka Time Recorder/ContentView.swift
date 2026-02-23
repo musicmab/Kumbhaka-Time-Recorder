@@ -24,7 +24,11 @@ private final class SoundDetector {
         self.onDetect = onDetect
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .allowBluetooth])
+        try session.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+        )
         try session.setActive(true)
         try configureAudioSessionForCurrentRoute(session)
 
@@ -88,9 +92,20 @@ private final class SoundDetector {
         let inputs = session.availableInputs ?? []
         let builtInMic = inputs.first(where: { $0.portType == .builtInMic })
         let bluetoothMic = inputs.first(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE })
+        let currentRoute = session.currentRoute
+        let isBluetoothRouteActive =
+            currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE }) ||
+            currentRoute.outputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE })
+
+        if isBluetoothRouteActive, let bluetoothMic {
+            // Bluetooth接続中はBluetoothマイクを優先。
+            try session.setPreferredInput(bluetoothMic)
+            try session.setMode(.voiceChat)
+            return
+        }
 
         if let builtInMic {
-            // 実機本体マイクを優先。
+            // 通常時は実機本体マイクを優先。
             try session.setPreferredInput(builtInMic)
             try session.setMode(.measurement)
             try session.overrideOutputAudioPort(.speaker)
