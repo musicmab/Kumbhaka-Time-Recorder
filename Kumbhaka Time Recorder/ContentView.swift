@@ -955,7 +955,8 @@ struct ContentView: View {
     private func speak(_ text: String, suppressDetection: Bool = false) {
         // ボタン状態が変わる案内時のみ、短時間だけ検知を無効化する
         if suppressDetection {
-            ignoreDetectedUntil = Date().addingTimeInterval(4.0)
+            let suppressionSeconds = (rechakaStartMode == .manual) ? 2.0 : 4.0
+            ignoreDetectedUntil = Date().addingTimeInterval(suppressionSeconds)
         }
         if announcer.isSpeaking {
             announcer.stopSpeaking(at: .immediate)
