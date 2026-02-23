@@ -12,16 +12,37 @@ private final class SoundDetector {
     private let engine = AVAudioEngine()
     private var onDetect: (() -> Void)?
     private var threshold: Float = 0.10
+    private var effectiveThreshold: Float = 0.10
     private var cooldown: TimeInterval = 0.55
+    private var inputPriority: MicInputPriority = .auto
+    private var autoCalibrationEnabled: Bool = true
+    private var calibrationEndsAt: Date?
+    private var calibrationRmsTotal: Float = 0
+    private var calibrationSampleCount: Int = 0
+    private var calibrationPeakRms: Float = 0
     private var lastDetectedAt: Date = .distantPast
     private var wasLoud: Bool = false
+    private var routeChangeObserver: NSObjectProtocol?
 
-    func start(threshold: Float = 0.10, cooldown: TimeInterval = 0.55, onDetect: @escaping () -> Void) throws {
+    func start(
+        threshold: Float = 0.10,
+        cooldown: TimeInterval = 0.55,
+        inputPriority: MicInputPriority = .auto,
+        autoCalibrationEnabled: Bool = true,
+        onDetect: @escaping () -> Void
+    ) throws {
         stop()
 
         self.threshold = threshold
+        self.effectiveThreshold = threshold
         self.cooldown = cooldown
+        self.inputPriority = inputPriority
+        self.autoCalibrationEnabled = autoCalibrationEnabled
         self.onDetect = onDetect
+        resetCalibrationState()
+        if autoCalibrationEnabled {
+            calibrationEndsAt = Date().addingTimeInterval(1.0)
+        }
 
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(
@@ -31,6 +52,53 @@ private final class SoundDetector {
         )
         try session.setActive(true)
         try configureAudioSessionForCurrentRoute(session)
+        observeRouteChanges()
+
+        try reinstallTapAndRestartEngine()
+    }
+
+    func stop() {
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+            self.routeChangeObserver = nil
+        }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        onDetect = nil
+        wasLoud = false
+    }
+
+    private func observeRouteChanges() {
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleRouteChange()
+        }
+    }
+
+    private func handleRouteChange() {
+        guard onDetect != nil else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setActive(true)
+            try configureAudioSessionForCurrentRoute(session)
+            try reinstallTapAndRestartEngine()
+            wasLoud = false
+            lastDetectedAt = Date()
+            resetCalibrationState()
+            if autoCalibrationEnabled {
+                calibrationEndsAt = Date().addingTimeInterval(0.8)
+            }
+        } catch {
+            // 入力切替直後に一時失敗することがあるため、ここでは無視する。
+        }
+    }
+
+    private func reinstallTapAndRestartEngine() throws {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
 
         let inputNode = engine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)
@@ -48,13 +116,6 @@ private final class SoundDetector {
         try engine.start()
     }
 
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        onDetect = nil
-        wasLoud = false
-    }
-
     private func analyze(buffer: AVAudioPCMBuffer) {
         guard let channelData = buffer.floatChannelData?[0] else { return }
 
@@ -68,10 +129,11 @@ private final class SoundDetector {
         }
 
         let rms = sqrt(sum / Float(max(1, frameCount / 2)))
+        processCalibrationIfNeeded(rms: rms)
 
         let now = Date()
 
-        if rms >= threshold {
+        if rms >= effectiveThreshold {
             if !wasLoud && now.timeIntervalSince(lastDetectedAt) >= cooldown {
                 lastDetectedAt = now
                 DispatchQueue.main.async { [onDetect] in
@@ -79,9 +141,32 @@ private final class SoundDetector {
                 }
             }
             wasLoud = true
-        } else if rms <= (threshold * 0.5) {
+        } else if rms <= (effectiveThreshold * 0.5) {
             wasLoud = false
         }
+    }
+
+    private func processCalibrationIfNeeded(rms: Float) {
+        guard let calibrationEndsAt else { return }
+        if Date() < calibrationEndsAt {
+            calibrationRmsTotal += rms
+            calibrationSampleCount += 1
+            calibrationPeakRms = max(calibrationPeakRms, rms)
+            return
+        }
+
+        let average = calibrationRmsTotal / Float(max(1, calibrationSampleCount))
+        let candidate = max(threshold, average * 3.0, calibrationPeakRms * 0.65)
+        effectiveThreshold = min(0.40, max(0.02, candidate))
+        self.calibrationEndsAt = nil
+    }
+
+    private func resetCalibrationState() {
+        effectiveThreshold = threshold
+        calibrationRmsTotal = 0
+        calibrationSampleCount = 0
+        calibrationPeakRms = 0
+        calibrationEndsAt = nil
     }
 
     private func isValid(format: AVAudioFormat) -> Bool {
@@ -97,26 +182,50 @@ private final class SoundDetector {
             currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE }) ||
             currentRoute.outputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE })
 
-        if isBluetoothRouteActive, let bluetoothMic {
-            // Bluetooth接続中はBluetoothマイクを優先。
-            try session.setPreferredInput(bluetoothMic)
-            try session.setMode(.voiceChat)
-            return
-        }
+        switch inputPriority {
+        case .auto:
+            if isBluetoothRouteActive, let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
 
-        if let builtInMic {
-            // 通常時は実機本体マイクを優先。
-            try session.setPreferredInput(builtInMic)
-            try session.setMode(.measurement)
-            try session.overrideOutputAudioPort(.speaker)
-            return
-        }
+        case .builtIn:
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
 
-        if let bluetoothMic {
-            // 本体マイクが使えない場合のみBluetooth入力へフォールバック。
-            try session.setPreferredInput(bluetoothMic)
-            try session.setMode(.voiceChat)
-            return
+        case .bluetooth:
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
         }
 
         try session.setPreferredInput(nil)
@@ -187,6 +296,8 @@ struct ContentView: View {
         AutoAdvanceMode(rawValue: autoAdvanceModeRaw) ?? .button
     }
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
+    @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
+    @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
@@ -202,6 +313,9 @@ struct ContentView: View {
     @AppStorage("speechEnableElapsedAnnouncement") private var speechEnableElapsedAnnouncement: Bool = true
     private var usesSoundAdvance: Bool {
         autoAdvanceMode == .sound
+    }
+    private var micInputPriority: MicInputPriority {
+        MicInputPriority(rawValue: micInputPriorityRaw) ?? .auto
     }
 
     // 表示形式
@@ -483,6 +597,16 @@ struct ContentView: View {
                 stopSoundDetectionIfNeeded()
             }
             .onChange(of: soundDetectionThreshold) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .onChange(of: micInputPriorityRaw) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .onChange(of: soundAutoCalibrationEnabled) { _, _ in
                 if soundDetectorRunning {
                     stopSoundDetectionIfNeeded()
                 }
@@ -910,7 +1034,12 @@ struct ContentView: View {
 
         if micPermissionGranted {
             do {
-                try soundDetector.start(threshold: Float(soundDetectionThreshold), cooldown: 0.5) {
+                try soundDetector.start(
+                    threshold: Float(soundDetectionThreshold),
+                    cooldown: 0.5,
+                    inputPriority: micInputPriority,
+                    autoCalibrationEnabled: soundAutoCalibrationEnabled
+                ) {
                     handleDetectedSoundAdvance()
                 }
                 soundDetectorRunning = true

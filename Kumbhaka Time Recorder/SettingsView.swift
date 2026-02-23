@@ -31,6 +31,22 @@ enum AutoAdvanceMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum MicInputPriority: String, CaseIterable, Identifiable {
+    case auto
+    case builtIn
+    case bluetooth
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .auto: return "自動"
+        case .builtIn: return "本体優先"
+        case .bluetooth: return "Bluetooth優先"
+        }
+    }
+}
+
 struct SettingsView: View {
     private enum PromptTarget {
         case rechakaStart
@@ -42,6 +58,8 @@ struct SettingsView: View {
     @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
     @AppStorage("autoAdvanceMode") private var autoAdvanceModeRaw: String = AutoAdvanceMode.button.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
+    @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
+    @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
@@ -96,6 +114,14 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
 
                 if autoAdvanceModeRaw == AutoAdvanceMode.sound.rawValue {
+                    Picker("入力優先", selection: $micInputPriorityRaw) {
+                        ForEach(MicInputPriority.allCases) { mode in
+                            Text(mode.label).tag(mode.rawValue)
+                        }
+                    }
+
+                    Toggle("マイク自動キャリブレーション", isOn: $soundAutoCalibrationEnabled)
+
                     HStack {
                         Text("検知しきい値")
                         Spacer()
@@ -110,11 +136,17 @@ struct SettingsView: View {
                         Text("値を小さくすると小さい音でも反応し、値を大きくすると大きい音で反応します。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
+                        Text("自動キャリブレーションON時は、開始直後に周囲ノイズを測ってしきい値を自動補正します。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                         Text("スタート後は、音を検知するたびに レーチャカ開始 → プーラカ開始 → 記録終了 と進みます。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     } else {
                         Text("値を小さくすると小さい音でも反応し、値を大きくすると大きい音で反応します。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Text("自動キャリブレーションON時は、開始直後に周囲ノイズを測ってしきい値を自動補正します。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                         Text("手動モードでは、レーチャカスタート後は音を検知するたびに レーチャカ開始 → レーチャカ停止 → プーラカ開始 → 記録終了 と進みます。")
