@@ -295,6 +295,7 @@ struct ContentView: View {
     private var autoAdvanceMode: AutoAdvanceMode {
         AutoAdvanceMode(rawValue: autoAdvanceModeRaw) ?? .button
     }
+    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.button.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
@@ -313,6 +314,9 @@ struct ContentView: View {
     @AppStorage("speechEnableElapsedAnnouncement") private var speechEnableElapsedAnnouncement: Bool = true
     private var usesSoundAdvance: Bool {
         autoAdvanceMode == .sound
+    }
+    private var usesSoundStart: Bool {
+        SoundStartMode(rawValue: soundStartModeRaw) == .sound
     }
     private var micInputPriority: MicInputPriority {
         MicInputPriority(rawValue: micInputPriorityRaw) ?? .auto
@@ -434,6 +438,9 @@ struct ContentView: View {
         case .auto:
             switch phase {
             case .idle:
+                if usesSoundStart {
+                    return "次の音でレーチャカ開始（ボタン開始も可能）"
+                }
                 return "スタートでレーチャカ開始（音検知は起動時から有効）"
             case .startToRechaka:
                 return "次の音でプーラカ開始（レーチャカ停止）"
@@ -445,6 +452,9 @@ struct ContentView: View {
         case .manual:
             switch phase {
             case .idle:
+                if usesSoundStart {
+                    return "次の音でレーチャカ開始（ボタン開始も可能）"
+                }
                 return "レーチャカスタートで計測開始（音検知は起動時から有効）"
             case .startToRechaka:
                 return "次の音でレーチャカ停止"
@@ -951,6 +961,10 @@ struct ContentView: View {
         guard Date() >= ignoreDetectedUntil else { return }
 
         switch phase {
+        case .idle:
+            if usesSoundStart {
+                startRechakaPhase()
+            }
         case .startToRechaka:
             rechakaStop()
         case .waitPuraakaStart:
