@@ -384,6 +384,7 @@ struct ContentView: View {
     @State private var lastAnnouncedBucketRechaka: Int = -1
     @State private var lastAnnouncedBucketPuraaka: Int = -1
     @State private var ignoreDetectedUntil: Date = .distantPast
+    @State private var soundInputMuted: Bool = false
 
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
@@ -491,6 +492,29 @@ struct ContentView: View {
                 ZStack {
                     elapsedHeader
                         .frame(maxWidth: .infinity, alignment: .center)
+
+                    if usesSoundAdvance {
+                        HStack {
+                            Button {
+                                playTapSound()
+                                soundInputMuted.toggle()
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: soundInputMuted ? "speaker.slash.fill" : "waveform")
+                                    Text(soundInputMuted ? "ミュート中" : "音ミュート")
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(.white)
+                                .frame(width: 150)
+                                .padding(.vertical, 8)
+                                .background(soundInputMuted ? Color.red : Color.gray)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(soundInputMuted ? "音ミュート解除" : "音ミュート")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    }
 
                     HStack {
                         Spacer()
@@ -958,6 +982,7 @@ struct ContentView: View {
 
     private func handleDetectedSoundAdvance() {
         guard isReady, usesSoundAdvance else { return }
+        guard !soundInputMuted else { return }
         guard Date() >= ignoreDetectedUntil else { return }
 
         switch phase {
