@@ -295,7 +295,7 @@ struct ContentView: View {
     private var autoAdvanceMode: AutoAdvanceMode {
         AutoAdvanceMode(rawValue: autoAdvanceModeRaw) ?? .button
     }
-    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.button.rawValue
+    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.manual.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
@@ -384,7 +384,7 @@ struct ContentView: View {
     @State private var lastAnnouncedBucketRechaka: Int = -1
     @State private var lastAnnouncedBucketPuraaka: Int = -1
     @State private var ignoreDetectedUntil: Date = .distantPast
-    @State private var soundInputMuted: Bool = false
+    @State private var soundInputMuted: Bool = true
 
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
@@ -493,29 +493,6 @@ struct ContentView: View {
                     elapsedHeader
                         .frame(maxWidth: .infinity, alignment: .center)
 
-                    if usesSoundAdvance {
-                        HStack {
-                            Button {
-                                playTapSound()
-                                soundInputMuted.toggle()
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: soundInputMuted ? "speaker.slash.fill" : "waveform")
-                                    Text(soundInputMuted ? "ミュート中" : "音ミュート")
-                                }
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundColor(.white)
-                                .frame(width: 150)
-                                .padding(.vertical, 8)
-                                .background(soundInputMuted ? Color.red : Color.gray)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(soundInputMuted ? "音ミュート解除" : "音ミュート")
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
-                    }
-
                     HStack {
                         Spacer()
                         ShareLink(item: mainShareText) {
@@ -609,6 +586,22 @@ struct ContentView: View {
                     NavigationLink("設定") { SettingsView() }
                         .buttonStyle(.bordered)
                         .disabled(!isReady)
+
+                    if usesSoundAdvance {
+                        Button {
+                            playTapSound()
+                            soundInputMuted.toggle()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: soundInputMuted ? "speaker.slash.fill" : "waveform")
+                                Text(soundInputMuted ? "ミュート中" : "音ミュート")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(soundInputMuted ? .red : .gray)
+                        .disabled(!isReady)
+                        .accessibilityLabel(soundInputMuted ? "音ミュート解除" : "音ミュート")
+                    }
                 }
 
                 Spacer()

@@ -32,15 +32,15 @@ enum AutoAdvanceMode: String, CaseIterable, Identifiable {
 }
 
 enum SoundStartMode: String, CaseIterable, Identifiable {
-    case button
+    case manual
     case sound
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .button: return "ボタン開始"
-        case .sound: return "音で開始"
+        case .manual: return "手動スタート"
+        case .sound: return "音検知スタート"
         }
     }
 }
@@ -71,7 +71,7 @@ struct SettingsView: View {
     // 計測方式
     @AppStorage("rechakaStartMode") private var rechakaStartModeRaw: String = RechakaStartMode.auto.rawValue
     @AppStorage("autoAdvanceMode") private var autoAdvanceModeRaw: String = AutoAdvanceMode.button.rawValue
-    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.button.rawValue
+    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.manual.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
@@ -129,7 +129,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
 
                 if autoAdvanceModeRaw == AutoAdvanceMode.sound.rawValue {
-                    Picker("開始方法", selection: $soundStartModeRaw) {
+                    Picker("スタート方法", selection: $soundStartModeRaw) {
                         ForEach(SoundStartMode.allCases) { mode in
                             Text(mode.label).tag(mode.rawValue)
                         }
