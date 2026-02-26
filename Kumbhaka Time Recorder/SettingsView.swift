@@ -75,6 +75,7 @@ struct SettingsView: View {
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
+    @AppStorage("speechRecognitionDebugLog") private var speechRecognitionDebugLog: String = ""
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
@@ -238,6 +239,26 @@ struct SettingsView: View {
                 Text("例: レーチャカ=レーチャカ, プーラカ=プーラカ")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("音声認識ログ") {
+                if speechRecognitionDebugLog.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("ログはまだありません。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        Text(speechRecognitionDebugLog)
+                            .font(.caption)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(minHeight: 120, maxHeight: 220)
+                }
+
+                Button("ログをクリア", role: .destructive) {
+                    speechRecognitionDebugLog = ""
+                }
             }
 
             Section("表示形式") {

@@ -3,6 +3,7 @@ import SwiftUI
 import SwiftData
 import AudioToolbox
 import AVFoundation
+import Speech
 
 private final class SoundDetector {
     enum DetectorError: Error {
@@ -23,12 +24,25 @@ private final class SoundDetector {
     private var lastDetectedAt: Date = .distantPast
     private var wasLoud: Bool = false
     private var routeChangeObserver: NSObjectProtocol?
+    private var onCancelKeyword: ((String) -> Void)?
+    private var isCancelKeywordAccepting: (() -> Bool)?
+    private var onRecognitionDebug: ((String, Bool, Bool) -> Void)?
+    private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var speechTask: SFSpeechRecognitionTask?
+    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+    private var lastCancelKeywordAt: Date = .distantPast
+    private var lastRecognizedText: String = ""
+    private var lastRecognizedAt: Date = .distantPast
+    private var nextSpeechRetryAt: Date = .distantPast
 
     func start(
         threshold: Float = 0.10,
         cooldown: TimeInterval = 0.55,
         inputPriority: MicInputPriority = .auto,
         autoCalibrationEnabled: Bool = true,
+        onCancelKeyword: ((String) -> Void)? = nil,
+        isCancelKeywordAccepting: (() -> Bool)? = nil,
+        onRecognitionDebug: ((String, Bool, Bool) -> Void)? = nil,
         onDetect: @escaping () -> Void
     ) throws {
         stop()
@@ -38,6 +52,9 @@ private final class SoundDetector {
         self.cooldown = cooldown
         self.inputPriority = inputPriority
         self.autoCalibrationEnabled = autoCalibrationEnabled
+        self.onCancelKeyword = onCancelKeyword
+        self.isCancelKeywordAccepting = isCancelKeywordAccepting
+        self.onRecognitionDebug = onRecognitionDebug
         self.onDetect = onDetect
         resetCalibrationState()
         if autoCalibrationEnabled {
@@ -62,9 +79,13 @@ private final class SoundDetector {
             NotificationCenter.default.removeObserver(routeChangeObserver)
             self.routeChangeObserver = nil
         }
+        stopSpeechRecognition()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         onDetect = nil
+        onCancelKeyword = nil
+        isCancelKeywordAccepting = nil
+        onRecognitionDebug = nil
         wasLoud = false
     }
 
@@ -109,9 +130,13 @@ private final class SoundDetector {
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            if self?.onCancelKeyword != nil {
+                self?.speechRequest?.append(buffer)
+            }
             self?.analyze(buffer: buffer)
         }
 
+        restartSpeechRecognitionIfNeeded()
         engine.prepare()
         try engine.start()
     }
@@ -167,6 +192,89 @@ private final class SoundDetector {
         calibrationSampleCount = 0
         calibrationPeakRms = 0
         calibrationEndsAt = nil
+    }
+
+    private func restartSpeechRecognitionIfNeeded() {
+        stopSpeechRecognition()
+        guard onCancelKeyword != nil else { return }
+        guard isCancelKeywordAccepting?() ?? false else { return }
+        guard Date() >= nextSpeechRetryAt else { return }
+        guard let speechRecognizer, speechRecognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        speechRequest = request
+
+        speechTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if let text = result?.bestTranscription.formattedString {
+                self.handleRecognized(text)
+            }
+            if error != nil {
+                self.nextSpeechRetryAt = Date().addingTimeInterval(8.0)
+                self.stopSpeechRecognition()
+            }
+        }
+    }
+
+    private func stopSpeechRecognition() {
+        speechTask?.cancel()
+        speechTask = nil
+        speechRequest?.endAudio()
+        speechRequest = nil
+    }
+
+    private func handleRecognized(_ text: String) {
+        let now = Date()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if trimmed == lastRecognizedText, now.timeIntervalSince(lastRecognizedAt) < 0.5 {
+            return
+        }
+        lastRecognizedText = trimmed
+        lastRecognizedAt = now
+
+        let normalized = text.lowercased().replacingOccurrences(
+            of: "[\\s、。,.!！?？・]",
+            with: "",
+            options: .regularExpression
+        )
+        let isCancelWord = normalized.contains("キャンセル") ||
+            normalized.contains("きゃんせる") ||
+            normalized.contains("ストップ") ||
+            normalized.contains("すとっぷ") ||
+            normalized.contains("stop")
+        let isMuteWord = normalized.contains("ミュート") ||
+            normalized.contains("みゅーと") ||
+            normalized.contains("mute")
+        let matched = isCancelWord || isMuteWord
+        let accepting = isCancelKeywordAccepting?() ?? false
+        let accepted = matched && accepting
+
+        DispatchQueue.main.async { [onRecognitionDebug] in
+            onRecognitionDebug?(trimmed, matched, accepted)
+        }
+
+        guard accepted else { return }
+
+        guard now.timeIntervalSince(lastCancelKeywordAt) >= 1.0 else { return }
+        lastCancelKeywordAt = now
+
+        let command = isMuteWord ? "mute" : "cancel"
+        DispatchQueue.main.async { [onCancelKeyword] in
+            onCancelKeyword?(command)
+        }
+    }
+
+    func updateCancelKeywordListening() {
+        let shouldListen = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        if shouldListen {
+            if speechTask == nil {
+                restartSpeechRecognitionIfNeeded()
+            }
+        } else {
+            stopSpeechRecognition()
+        }
     }
 
     private func isValid(format: AVAudioFormat) -> Bool {
@@ -299,6 +407,7 @@ struct ContentView: View {
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
+    @AppStorage("speechRecognitionDebugLog") private var speechRecognitionDebugLog: String = ""
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
     @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
@@ -357,6 +466,9 @@ struct ContentView: View {
     @State private var micPermissionAsked = false
     @State private var micPermissionGranted = false
     @State private var showMicPermissionAlert = false
+    @State private var speechPermissionAsked = false
+    @State private var speechPermissionGranted = false
+    @State private var showSpeechPermissionAlert = false
 
     // ===== フェーズ =====
     private enum Phase {
@@ -385,6 +497,8 @@ struct ContentView: View {
     @State private var lastAnnouncedBucketPuraaka: Int = -1
     @State private var ignoreDetectedUntil: Date = .distantPast
     @State private var soundInputMuted: Bool = true
+    @State private var cancelKeywordAcceptUntil: Date = .distantPast
+    @State private var preStartSnapshot: (startedAt: Date?, puraakaAt: Date?, lastRechaka: Double?, lastPuraaka: Double?, lastCompletedStartedAt: Date?)? = nil
 
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
@@ -638,10 +752,20 @@ struct ContentView: View {
                     stopSoundDetectionIfNeeded()
                 }
             }
+            .onChange(of: speechPermissionGranted) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
             .alert("マイク許可が必要です", isPresented: $showMicPermissionAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text("音検知モードを使うには、マイク許可を有効にし、入力デバイスが利用可能な状態にしてください。")
+            }
+            .alert("音声認識の許可が必要です", isPresented: $showSpeechPermissionAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("スタート後5秒の「キャンセル / ストップ」取り消し機能には音声認識の許可が必要です。")
             }
         }
     }
@@ -869,6 +993,13 @@ struct ContentView: View {
 
     private func startRechakaPhase() {
         prepareSpeechIfNeeded()
+        preStartSnapshot = (
+            startedAt: startedAt,
+            puraakaAt: puraakaAt,
+            lastRechaka: lastRechaka,
+            lastPuraaka: lastPuraaka,
+            lastCompletedStartedAt: lastCompletedStartedAt
+        )
 
         let t = Date()
         startedAt = t
@@ -877,6 +1008,7 @@ struct ContentView: View {
         puraakaAt = nil
         now = t
         phase = .startToRechaka
+        cancelKeywordAcceptUntil = t.addingTimeInterval(5.0)
 
         lastAnnouncedBucketRechaka = -1
         if !speechEnableRechakaStart {
@@ -968,9 +1100,51 @@ struct ContentView: View {
             announcer.stopSpeaking(at: .immediate)
         }
         phase = .idle
+        cancelKeywordAcceptUntil = .distantPast
 
         // ✅ 保存後に今日分を再取得（即時反映）
         fetchTodaySessions()
+    }
+
+    private func revertToBeforeStartByVoiceCommand(command: String) {
+        guard Date() <= cancelKeywordAcceptUntil else { return }
+        guard let snapshot = preStartSnapshot else { return }
+
+        startedAt = snapshot.startedAt
+        puraakaAt = snapshot.puraakaAt
+        lastRechaka = snapshot.lastRechaka
+        lastPuraaka = snapshot.lastPuraaka
+        lastCompletedStartedAt = snapshot.lastCompletedStartedAt
+        phase = .idle
+        now = Date()
+        lastAnnouncedBucketRechaka = -1
+        lastAnnouncedBucketPuraaka = -1
+        cancelKeywordAcceptUntil = .distantPast
+        preStartSnapshot = nil
+        if command == "mute" {
+            soundInputMuted = true
+        }
+        ignoreDetectedUntil = Date().addingTimeInterval(1.0)
+    }
+
+    private func appendSpeechRecognitionLog(text: String, matchedKeyword: Bool, accepted: Bool) {
+        let status: String
+        if accepted {
+            status = "受理"
+        } else if matchedKeyword {
+            status = "一致(無効時間)"
+        } else {
+            status = "無視"
+        }
+        let timestamp = Self.timeOnly.string(from: Date())
+        let line = "\(timestamp) [\(status)] \(text)"
+
+        var lines = speechRecognitionDebugLog.split(whereSeparator: \.isNewline).map(String.init)
+        lines.append(line)
+        if lines.count > 120 {
+            lines.removeFirst(lines.count - 120)
+        }
+        speechRecognitionDebugLog = lines.joined(separator: "\n")
     }
 
     private func handleDetectedSoundAdvance() {
@@ -1022,6 +1196,7 @@ struct ContentView: View {
             }
 
             refreshSoundDetectionStateIfNeeded()
+            soundDetector.updateCancelKeywordListening()
             announceIfNeeded()
             try? await Task.sleep(nanoseconds: tickInterval)
         }
@@ -1064,13 +1239,26 @@ struct ContentView: View {
 
         if soundDetectorRunning { return }
 
+        if !speechPermissionGranted {
+            requestSpeechPermissionIfNeeded()
+        }
+
         if micPermissionGranted {
             do {
                 try soundDetector.start(
                     threshold: Float(soundDetectionThreshold),
                     cooldown: 0.5,
                     inputPriority: micInputPriority,
-                    autoCalibrationEnabled: soundAutoCalibrationEnabled
+                    autoCalibrationEnabled: soundAutoCalibrationEnabled,
+                    onCancelKeyword: speechPermissionGranted ? { command in
+                        revertToBeforeStartByVoiceCommand(command: command)
+                    } : nil,
+                    isCancelKeywordAccepting: {
+                        Date() <= cancelKeywordAcceptUntil
+                    },
+                    onRecognitionDebug: { text, matched, accepted in
+                        appendSpeechRecognitionLog(text: text, matchedKeyword: matched, accepted: accepted)
+                    }
                 ) {
                     handleDetectedSoundAdvance()
                 }
@@ -1097,6 +1285,32 @@ struct ContentView: View {
                 AVAudioApplication.requestRecordPermission(completionHandler: permissionHandler)
             } else {
                 AVAudioSession.sharedInstance().requestRecordPermission(permissionHandler)
+            }
+        }
+    }
+
+    private func requestSpeechPermissionIfNeeded() {
+        let status = SFSpeechRecognizer.authorizationStatus()
+        if status == .authorized {
+            speechPermissionAsked = true
+            speechPermissionGranted = true
+            return
+        }
+        if status == .denied || status == .restricted {
+            speechPermissionAsked = true
+            speechPermissionGranted = false
+            showSpeechPermissionAlert = true
+            return
+        }
+
+        guard !speechPermissionAsked else { return }
+        speechPermissionAsked = true
+        SFSpeechRecognizer.requestAuthorization { result in
+            DispatchQueue.main.async {
+                speechPermissionGranted = (result == .authorized)
+                if !speechPermissionGranted {
+                    showSpeechPermissionAlert = true
+                }
             }
         }
     }
