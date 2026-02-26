@@ -26,6 +26,8 @@ private final class SoundDetector {
     private var routeChangeObserver: NSObjectProtocol?
     private var onCancelKeyword: ((String) -> Void)?
     private var isCancelKeywordAccepting: (() -> Bool)?
+    private var onUnmuteKeyword: (() -> Void)?
+    private var isUnmuteKeywordAccepting: (() -> Bool)?
     private var onRecognitionDebug: ((String, Bool, Bool) -> Void)?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SFSpeechRecognitionTask?
@@ -42,6 +44,8 @@ private final class SoundDetector {
         autoCalibrationEnabled: Bool = true,
         onCancelKeyword: ((String) -> Void)? = nil,
         isCancelKeywordAccepting: (() -> Bool)? = nil,
+        onUnmuteKeyword: (() -> Void)? = nil,
+        isUnmuteKeywordAccepting: (() -> Bool)? = nil,
         onRecognitionDebug: ((String, Bool, Bool) -> Void)? = nil,
         onDetect: @escaping () -> Void
     ) throws {
@@ -54,6 +58,8 @@ private final class SoundDetector {
         self.autoCalibrationEnabled = autoCalibrationEnabled
         self.onCancelKeyword = onCancelKeyword
         self.isCancelKeywordAccepting = isCancelKeywordAccepting
+        self.onUnmuteKeyword = onUnmuteKeyword
+        self.isUnmuteKeywordAccepting = isUnmuteKeywordAccepting
         self.onRecognitionDebug = onRecognitionDebug
         self.onDetect = onDetect
         resetCalibrationState()
@@ -85,6 +91,8 @@ private final class SoundDetector {
         onDetect = nil
         onCancelKeyword = nil
         isCancelKeywordAccepting = nil
+        onUnmuteKeyword = nil
+        isUnmuteKeywordAccepting = nil
         onRecognitionDebug = nil
         wasLoud = false
     }
@@ -196,8 +204,9 @@ private final class SoundDetector {
 
     private func restartSpeechRecognitionIfNeeded() {
         stopSpeechRecognition()
-        guard onCancelKeyword != nil else { return }
-        guard isCancelKeywordAccepting?() ?? false else { return }
+        let shouldListenForCancel = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        let shouldListenForUnmute = (onUnmuteKeyword != nil) && (isUnmuteKeywordAccepting?() ?? false)
+        guard shouldListenForCancel || shouldListenForUnmute else { return }
         guard Date() >= nextSpeechRetryAt else { return }
         guard let speechRecognizer, speechRecognizer.isAvailable else { return }
 
@@ -239,17 +248,32 @@ private final class SoundDetector {
             with: "",
             options: .regularExpression
         )
+        let hasCancelHead = normalized.contains("キャン") ||
+            normalized.contains("きゃん") ||
+            normalized.contains("can")
+        let hasCancelTail = normalized.contains("セル") ||
+            normalized.contains("せる") ||
+            normalized.contains("sel") ||
+            normalized.contains("cell")
         let isCancelWord = normalized.contains("キャンセル") ||
             normalized.contains("きゃんせる") ||
+            normalized.contains("cancel") ||
+            (hasCancelHead && hasCancelTail) ||
             normalized.contains("ストップ") ||
             normalized.contains("すとっぷ") ||
             normalized.contains("stop")
         let isMuteWord = normalized.contains("ミュート") ||
             normalized.contains("みゅーと") ||
             normalized.contains("mute")
-        let matched = isCancelWord || isMuteWord
-        let accepting = isCancelKeywordAccepting?() ?? false
-        let accepted = matched && accepting
+        let isUnmuteWord = normalized.contains("ミュート解除") ||
+            normalized.contains("みゅーとかいじょ") ||
+            normalized.contains("unmute")
+        let matched = isCancelWord || isMuteWord || isUnmuteWord
+        let cancelAccepting = isCancelKeywordAccepting?() ?? false
+        let unmuteAccepting = isUnmuteKeywordAccepting?() ?? false
+        let acceptedCancel = (isCancelWord || isMuteWord) && cancelAccepting
+        let acceptedUnmute = isUnmuteWord && unmuteAccepting
+        let accepted = acceptedCancel || acceptedUnmute
 
         DispatchQueue.main.async { [onRecognitionDebug] in
             onRecognitionDebug?(trimmed, matched, accepted)
@@ -260,14 +284,20 @@ private final class SoundDetector {
         guard now.timeIntervalSince(lastCancelKeywordAt) >= 1.0 else { return }
         lastCancelKeywordAt = now
 
-        let command = isMuteWord ? "mute" : "cancel"
-        DispatchQueue.main.async { [onCancelKeyword] in
-            onCancelKeyword?(command)
+        DispatchQueue.main.async { [onCancelKeyword, onUnmuteKeyword] in
+            if acceptedUnmute {
+                onUnmuteKeyword?()
+            } else {
+                let command = isMuteWord ? "mute" : "cancel"
+                onCancelKeyword?(command)
+            }
         }
     }
 
     func updateCancelKeywordListening() {
-        let shouldListen = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        let shouldListenCancel = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        let shouldListenUnmute = (onUnmuteKeyword != nil) && (isUnmuteKeywordAccepting?() ?? false)
+        let shouldListen = shouldListenCancel || shouldListenUnmute
         if shouldListen {
             if speechTask == nil {
                 restartSpeechRecognitionIfNeeded()
@@ -708,13 +738,13 @@ struct ContentView: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: soundInputMuted ? "speaker.slash.fill" : "waveform")
-                                Text(soundInputMuted ? "ミュート中" : "音ミュート")
+                                Text(soundInputMuted ? "ミュート中" : "音声認識中")
                             }
                         }
                         .buttonStyle(.bordered)
                         .tint(soundInputMuted ? .red : .gray)
                         .disabled(!isReady)
-                        .accessibilityLabel(soundInputMuted ? "音ミュート解除" : "音ミュート")
+                        .accessibilityLabel(soundInputMuted ? "ミュート解除" : "ミュート")
                     }
                 }
 
@@ -1127,6 +1157,12 @@ struct ContentView: View {
         ignoreDetectedUntil = Date().addingTimeInterval(1.0)
     }
 
+    private func unmuteByVoiceCommand() {
+        guard soundInputMuted else { return }
+        soundInputMuted = false
+        ignoreDetectedUntil = Date().addingTimeInterval(0.8)
+    }
+
     private func appendSpeechRecognitionLog(text: String, matchedKeyword: Bool, accepted: Bool) {
         let status: String
         if accepted {
@@ -1255,6 +1291,12 @@ struct ContentView: View {
                     } : nil,
                     isCancelKeywordAccepting: {
                         Date() <= cancelKeywordAcceptUntil
+                    },
+                    onUnmuteKeyword: speechPermissionGranted ? {
+                        unmuteByVoiceCommand()
+                    } : nil,
+                    isUnmuteKeywordAccepting: {
+                        soundInputMuted
                     },
                     onRecognitionDebug: { text, matched, accepted in
                         appendSpeechRecognitionLog(text: text, matchedKeyword: matched, accepted: accepted)
