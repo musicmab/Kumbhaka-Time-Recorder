@@ -61,6 +61,32 @@ enum MicInputPriority: String, CaseIterable, Identifiable {
     }
 }
 
+enum RemoteControlKey: String, CaseIterable, Identifiable {
+    case rightArrow
+    case leftArrow
+    case upArrow
+    case downArrow
+    case returnKey
+    case spaceKey
+    case pageUp
+    case pageDown
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .rightArrow: return "右"
+        case .leftArrow: return "左"
+        case .upArrow: return "上"
+        case .downArrow: return "下"
+        case .returnKey: return "Enter"
+        case .spaceKey: return "Space"
+        case .pageUp: return "Page Up"
+        case .pageDown: return "Page Down"
+        }
+    }
+}
+
 struct SettingsView: View {
     private enum PromptTarget {
         case rechakaStart
@@ -73,8 +99,12 @@ struct SettingsView: View {
     @AppStorage("autoAdvanceMode") private var autoAdvanceModeRaw: String = AutoAdvanceMode.button.rawValue
     @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.manual.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
+    @AppStorage("autoPuraakaDelaySeconds") private var autoPuraakaDelaySeconds: Double = 4.0
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
+    @AppStorage("remoteControlEnabled") private var remoteControlEnabled: Bool = true
+    @AppStorage("remoteProgressKey") private var remoteProgressKeyRaw: String = RemoteControlKey.rightArrow.rawValue
+    @AppStorage("remoteMuteKey") private var remoteMuteKeyRaw: String = RemoteControlKey.leftArrow.rawValue
     @AppStorage("speechRecognitionDebugLog") private var speechRecognitionDebugLog: String = ""
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
@@ -153,6 +183,18 @@ struct SettingsView: View {
                     }
 
                     Slider(value: $soundDetectionThreshold, in: 0.02...0.30, step: 0.01)
+
+                    if rechakaStartModeRaw == RechakaStartMode.auto.rawValue {
+                        HStack {
+                            Text("プーラカ開始まで")
+                            Spacer()
+                            Text("\(Int(autoPuraakaDelaySeconds))秒")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Slider(value: $autoPuraakaDelaySeconds, in: 1.0...10.0, step: 1.0)
+                    }
 
                     if rechakaStartModeRaw == RechakaStartMode.auto.rawValue {
                         Text("値を小さくすると小さい音でも反応し、値を大きくすると大きい音で反応します。")
@@ -259,6 +301,28 @@ struct SettingsView: View {
                 Button("ログをクリア", role: .destructive) {
                     speechRecognitionDebugLog = ""
                 }
+            }
+
+            Section("外部リモコン") {
+                Toggle("外部リモコンを使う", isOn: $remoteControlEnabled)
+
+                Picker("進行ボタン", selection: $remoteProgressKeyRaw) {
+                    ForEach(RemoteControlKey.allCases) { key in
+                        Text(key.label).tag(key.rawValue)
+                    }
+                }
+                .disabled(!remoteControlEnabled)
+
+                Picker("ミュートボタン", selection: $remoteMuteKeyRaw) {
+                    ForEach(RemoteControlKey.allCases) { key in
+                        Text(key.label).tag(key.rawValue)
+                    }
+                }
+                .disabled(!remoteControlEnabled)
+
+                Text("Canonクリッカーなどの外部ボタン入力を、進行操作とミュート切替に割り当てます。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section("表示形式") {

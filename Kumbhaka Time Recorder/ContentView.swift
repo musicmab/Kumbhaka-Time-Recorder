@@ -4,6 +4,7 @@ import SwiftData
 import AudioToolbox
 import AVFoundation
 import Speech
+import UIKit
 
 private final class SoundDetector {
     enum DetectorError: Error {
@@ -372,6 +373,136 @@ private final class SoundDetector {
     }
 }
 
+private final class CueTonePlayer {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private let buffer: AVAudioPCMBuffer?
+
+    init() {
+        let sampleRate = 44_100.0
+        let duration = 0.08
+        let frameCount = AVAudioFrameCount(sampleRate * duration)
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
+        let buffer = format.flatMap { AVAudioPCMBuffer(pcmFormat: $0, frameCapacity: frameCount) }
+        self.buffer = buffer
+
+        if let format, let buffer, let channel = buffer.floatChannelData?[0] {
+            buffer.frameLength = frameCount
+            let frequency = 1760.0
+            for i in 0..<Int(frameCount) {
+                let progress = Double(i) / sampleRate
+                let envelope = 1.0 - (Double(i) / Double(frameCount))
+                let sample = sin(2.0 * Double.pi * frequency * progress) * 0.28 * envelope
+                channel[i] = Float(sample)
+            }
+
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+        }
+    }
+
+    func play() {
+        guard let buffer else { return }
+
+        do {
+            if !engine.isRunning {
+                try engine.start()
+            }
+            player.stop()
+            player.scheduleBuffer(buffer, at: nil, options: .interrupts)
+            player.play()
+        } catch {
+            AudioServicesPlaySystemSound(1104)
+        }
+    }
+}
+
+private struct RemoteKeyCaptureView: UIViewControllerRepresentable {
+    let handlers: [RemoteControlKey: () -> Void]
+
+    func makeUIViewController(context: Context) -> RemoteKeyCaptureController {
+        let controller = RemoteKeyCaptureController()
+        controller.handlers = handlers
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: RemoteKeyCaptureController, context: Context) {
+        uiViewController.handlers = handlers
+        DispatchQueue.main.async {
+            uiViewController.becomeFirstResponderIfPossible()
+        }
+    }
+}
+
+private final class RemoteKeyCaptureController: UIViewController {
+    var handlers: [RemoteControlKey: () -> Void] = [:] {
+        didSet { reloadKeyCommands() }
+    }
+
+    private var cachedCommands: [UIKeyCommand] = []
+
+    override var canBecomeFirstResponder: Bool { true }
+    override var keyCommands: [UIKeyCommand]? { cachedCommands }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
+    }
+
+    func becomeFirstResponderIfPossible() {
+        if view.window != nil {
+            becomeFirstResponder()
+        }
+    }
+
+    private func reloadKeyCommands() {
+        cachedCommands = handlers.keys.map { key in
+            let command = UIKeyCommand(
+                input: key.uiInput,
+                modifierFlags: [],
+                action: #selector(handleKeyCommand(_:))
+            )
+            command.discoverabilityTitle = key.label
+            return command
+        }
+    }
+
+    @objc private func handleKeyCommand(_ sender: UIKeyCommand) {
+        guard let input = sender.input else { return }
+        guard let key = RemoteControlKey(uiInput: input) else { return }
+        handlers[key]?()
+    }
+}
+
+private extension RemoteControlKey {
+    var uiInput: String {
+        switch self {
+        case .rightArrow: return UIKeyCommand.inputRightArrow
+        case .leftArrow: return UIKeyCommand.inputLeftArrow
+        case .upArrow: return UIKeyCommand.inputUpArrow
+        case .downArrow: return UIKeyCommand.inputDownArrow
+        case .returnKey: return "\r"
+        case .spaceKey: return " "
+        case .pageUp: return UIKeyCommand.inputPageUp
+        case .pageDown: return UIKeyCommand.inputPageDown
+        }
+    }
+
+    init?(uiInput: String) {
+        switch uiInput {
+        case UIKeyCommand.inputRightArrow: self = .rightArrow
+        case UIKeyCommand.inputLeftArrow: self = .leftArrow
+        case UIKeyCommand.inputUpArrow: self = .upArrow
+        case UIKeyCommand.inputDownArrow: self = .downArrow
+        case "\r": self = .returnKey
+        case " ": self = .spaceKey
+        case UIKeyCommand.inputPageUp: self = .pageUp
+        case UIKeyCommand.inputPageDown: self = .pageDown
+        default: return nil
+        }
+    }
+}
+
 // 表示形式
 enum TimeDisplayStyle: String, CaseIterable, Identifiable {
     case minuteSecond
@@ -435,8 +566,12 @@ struct ContentView: View {
     }
     @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.manual.rawValue
     @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
+    @AppStorage("autoPuraakaDelaySeconds") private var autoPuraakaDelaySeconds: Double = 4.0
     @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
     @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
+    @AppStorage("remoteControlEnabled") private var remoteControlEnabled: Bool = true
+    @AppStorage("remoteProgressKey") private var remoteProgressKeyRaw: String = RemoteControlKey.rightArrow.rawValue
+    @AppStorage("remoteMuteKey") private var remoteMuteKeyRaw: String = RemoteControlKey.leftArrow.rawValue
     @AppStorage("speechRecognitionDebugLog") private var speechRecognitionDebugLog: String = ""
     @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
     @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
@@ -459,6 +594,12 @@ struct ContentView: View {
     }
     private var micInputPriority: MicInputPriority {
         MicInputPriority(rawValue: micInputPriorityRaw) ?? .auto
+    }
+    private var remoteProgressKey: RemoteControlKey {
+        RemoteControlKey(rawValue: remoteProgressKeyRaw) ?? .rightArrow
+    }
+    private var remoteMuteKey: RemoteControlKey {
+        RemoteControlKey(rawValue: remoteMuteKeyRaw) ?? .leftArrow
     }
 
     // 表示形式
@@ -534,6 +675,7 @@ struct ContentView: View {
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
     private let announcer = AVSpeechSynthesizer()
+    private let cueTonePlayer = CueTonePlayer()
 
     // ✅ 日付跨ぎ監視タスク
     @State private var midnightTask: Task<Void, Never>? = nil
@@ -754,6 +896,17 @@ struct ContentView: View {
                 Spacer()
             }
             .padding()
+            .background(
+                RemoteKeyCaptureView(
+                    handlers: remoteControlEnabled
+                        ? [
+                            remoteProgressKey: { handleRemoteProgressButton() },
+                            remoteMuteKey: { handleRemoteMuteButton() }
+                        ]
+                        : [:]
+                )
+                .frame(width: 0, height: 0)
+            )
             .task {
                 // 起動時に今日分を取得
                 await MainActor.run { fetchTodaySessions() }
@@ -1025,6 +1178,27 @@ struct ContentView: View {
         }
     }
 
+    private func handleRemoteProgressButton() {
+        guard remoteControlEnabled, isReady else { return }
+
+        if canTapStart {
+            handleStartButton()
+            return
+        }
+        if phase == .startToRechaka {
+            rechakaStop()
+            return
+        }
+        if phase == .puraakaRunning {
+            finishPuraakaAndSave()
+        }
+    }
+
+    private func handleRemoteMuteButton() {
+        guard remoteControlEnabled, isReady else { return }
+        soundInputMuted.toggle()
+    }
+
     private func startRechakaPhase() {
         cancelPendingAutoPuraakaStart()
         prepareSpeechIfNeeded()
@@ -1070,7 +1244,7 @@ struct ContentView: View {
             } else if announcer.isSpeaking {
                 announcer.stopSpeaking(at: .immediate)
             }
-            scheduleAutoPuraakaStart(after: 5.0)
+            scheduleAutoPuraakaStart(after: autoPuraakaDelaySeconds)
 
         case .manual:
             puraakaAt = nil
@@ -1195,6 +1369,7 @@ struct ContentView: View {
         guard isReady, usesSoundAdvance else { return }
         guard !soundInputMuted else { return }
         guard Date() >= ignoreDetectedUntil else { return }
+        guard !(phase == .idle && announcer.isSpeaking) else { return }
 
         switch phase {
         case .idle:
@@ -1220,6 +1395,7 @@ struct ContentView: View {
             self.pendingAutoPuraakaStartWorkItem = nil
             guard self.rechakaStartMode == .auto, self.phase == .waitPuraakaStart else { return }
 
+            self.playResumeCueSound()
             let t = Date()
             self.puraakaAt = t
             self.now = t
@@ -1490,6 +1666,10 @@ struct ContentView: View {
 
     private func playTapSound() {
         AudioServicesPlaySystemSound(1104)
+    }
+
+    private func playResumeCueSound() {
+        cueTonePlayer.play()
     }
 
     private func bigButton(title: String, enabled: Bool, background: Color, action: @escaping () -> Void) -> some View {
