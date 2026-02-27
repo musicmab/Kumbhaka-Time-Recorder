@@ -671,7 +671,6 @@ struct ContentView: View {
     @State private var cancelKeywordAcceptUntil: Date = .distantPast
     @State private var preStartSnapshot: (startedAt: Date?, puraakaAt: Date?, lastRechaka: Double?, lastPuraaka: Double?, lastCompletedStartedAt: Date?)? = nil
     @State private var pendingAutoPuraakaStartWorkItem: DispatchWorkItem? = nil
-
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
     private let announcer = AVSpeechSynthesizer()
