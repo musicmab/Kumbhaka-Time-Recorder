@@ -213,7 +213,7 @@ struct SettingsView: View {
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
-                Slider(value: $speechVolume, in: 0.0...1.0, step: 0.05)
+                Slider(value: $speechVolume, in: 0.0...1.2, step: 0.05)
 
                 Text("読み分け辞書（1行ごとに 単語=読み）")
                     .font(.footnote)
@@ -352,7 +352,8 @@ struct SettingsView: View {
         utterance.voice = AVSpeechSynthesisVoice(language: "ja-JP")
         utterance.rate = Float(min(0.65, max(0.30, speechRate)))
         utterance.pitchMultiplier = Float(min(1.40, max(0.70, speechPitch)))
-        utterance.volume = Float(min(1.0, max(0.0, speechVolume)))
+        let boostedVolume = min(1.0, max(0.0, speechVolume * 1.25))
+        utterance.volume = Float(boostedVolume)
         SpeechPreviewPlayer.shared.play(utterance)
     }
 

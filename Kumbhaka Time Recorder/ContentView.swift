@@ -529,6 +529,7 @@ struct ContentView: View {
     @State private var soundInputMuted: Bool = true
     @State private var cancelKeywordAcceptUntil: Date = .distantPast
     @State private var preStartSnapshot: (startedAt: Date?, puraakaAt: Date?, lastRechaka: Double?, lastPuraaka: Double?, lastCompletedStartedAt: Date?)? = nil
+    @State private var pendingAutoPuraakaStartWorkItem: DispatchWorkItem? = nil
 
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
@@ -573,7 +574,7 @@ struct ContentView: View {
     }
 
     private var canTapStart: Bool {
-        phase == .idle || phase == .waitPuraakaStart
+        phase == .idle || (phase == .waitPuraakaStart && rechakaStartMode == .manual)
     }
 
     private var soundModeGuideText: String? {
@@ -588,7 +589,9 @@ struct ContentView: View {
                 }
                 return "スタートでレーチャカ開始（音検知は起動時から有効）"
             case .startToRechaka:
-                return "次の音でプーラカ開始（レーチャカ停止）"
+                return "次の音でレーチャカ停止"
+            case .waitPuraakaStart:
+                return "レーチャカ停止後、5秒でプーラカ開始"
             case .puraakaRunning:
                 return "次の音でストップして記録保存"
             default:
@@ -765,6 +768,7 @@ struct ContentView: View {
             .onDisappear {
                 midnightTask?.cancel()
                 midnightTask = nil
+                cancelPendingAutoPuraakaStart()
                 stopSoundDetectionIfNeeded()
             }
             .onChange(of: soundDetectionThreshold) { _, _ in
@@ -1022,6 +1026,7 @@ struct ContentView: View {
     }
 
     private func startRechakaPhase() {
+        cancelPendingAutoPuraakaStart()
         prepareSpeechIfNeeded()
         preStartSnapshot = (
             startedAt: startedAt,
@@ -1058,14 +1063,14 @@ struct ContentView: View {
 
         switch rechakaStartMode {
         case .auto:
-            puraakaAt = t
-            lastAnnouncedBucketPuraaka = -1
-            phase = .puraakaRunning
+            puraakaAt = nil
+            phase = .waitPuraakaStart
             if speechEnableRechakaStop {
                 speak(normalizedPrompt(autoVoicePromptRechakaStop, fallback: "レーチャカストップ"), suppressDetection: true)
             } else if announcer.isSpeaking {
                 announcer.stopSpeaking(at: .immediate)
             }
+            scheduleAutoPuraakaStart(after: 5.0)
 
         case .manual:
             puraakaAt = nil
@@ -1079,6 +1084,7 @@ struct ContentView: View {
     }
 
     private func startPuraakaPhaseManually() {
+        cancelPendingAutoPuraakaStart()
         prepareSpeechIfNeeded()
 
         let t = Date()
@@ -1096,6 +1102,7 @@ struct ContentView: View {
 
     private func finishPuraakaAndSave() {
         guard let startedAt, let puraakaAt else { return }
+        cancelPendingAutoPuraakaStart()
         let t = Date()
 
         lastPuraaka = t.timeIntervalSince(puraakaAt)
@@ -1151,6 +1158,7 @@ struct ContentView: View {
         lastAnnouncedBucketPuraaka = -1
         cancelKeywordAcceptUntil = .distantPast
         preStartSnapshot = nil
+        cancelPendingAutoPuraakaStart()
         if command == "mute" {
             soundInputMuted = true
         }
@@ -1196,12 +1204,35 @@ struct ContentView: View {
         case .startToRechaka:
             rechakaStop()
         case .waitPuraakaStart:
-            startPuraakaPhaseManually()
+            if rechakaStartMode == .manual {
+                startPuraakaPhaseManually()
+            }
         case .puraakaRunning:
             finishPuraakaAndSave()
         default:
             break
         }
+    }
+
+    private func scheduleAutoPuraakaStart(after delay: TimeInterval) {
+        cancelPendingAutoPuraakaStart()
+        let work = DispatchWorkItem {
+            self.pendingAutoPuraakaStartWorkItem = nil
+            guard self.rechakaStartMode == .auto, self.phase == .waitPuraakaStart else { return }
+
+            let t = Date()
+            self.puraakaAt = t
+            self.now = t
+            self.phase = .puraakaRunning
+            self.lastAnnouncedBucketPuraaka = -1
+        }
+        pendingAutoPuraakaStartWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func cancelPendingAutoPuraakaStart() {
+        pendingAutoPuraakaStartWorkItem?.cancel()
+        pendingAutoPuraakaStartWorkItem = nil
     }
 
     // MARK: - Stability
@@ -1290,7 +1321,7 @@ struct ContentView: View {
                         revertToBeforeStartByVoiceCommand(command: command)
                     } : nil,
                     isCancelKeywordAccepting: {
-                        Date() <= cancelKeywordAcceptUntil
+                        Date() <= cancelKeywordAcceptUntil && !soundInputMuted
                     },
                     onUnmuteKeyword: speechPermissionGranted ? {
                         unmuteByVoiceCommand()
@@ -1399,7 +1430,8 @@ struct ContentView: View {
         u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
         u.rate = Float(min(0.65, max(0.30, speechRate)))
         u.pitchMultiplier = Float(min(1.40, max(0.70, speechPitch)))
-        u.volume = Float(min(1.0, max(0.0, speechVolume)))
+        let boostedVolume = min(1.0, max(0.0, speechVolume * 1.25))
+        u.volume = Float(boostedVolume)
         announcer.speak(u)
     }
 
