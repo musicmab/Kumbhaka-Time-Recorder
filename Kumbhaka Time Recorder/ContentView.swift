@@ -33,6 +33,7 @@ private final class SoundDetector {
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SFSpeechRecognitionTask?
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+    private var isStoppingSpeechRecognition = false
     private var lastCancelKeywordAt: Date = .distantPast
     private var lastRecognizedText: String = ""
     private var lastRecognizedAt: Date = .distantPast
@@ -210,6 +211,7 @@ private final class SoundDetector {
         guard shouldListenForCancel || shouldListenForUnmute else { return }
         guard Date() >= nextSpeechRetryAt else { return }
         guard let speechRecognizer, speechRecognizer.isAvailable else { return }
+        isStoppingSpeechRecognition = false
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -221,6 +223,10 @@ private final class SoundDetector {
                 self.handleRecognized(text)
             }
             if error != nil {
+                if self.isStoppingSpeechRecognition {
+                    self.isStoppingSpeechRecognition = false
+                    return
+                }
                 self.nextSpeechRetryAt = Date().addingTimeInterval(8.0)
                 self.stopSpeechRecognition()
             }
@@ -228,6 +234,7 @@ private final class SoundDetector {
     }
 
     private func stopSpeechRecognition() {
+        isStoppingSpeechRecognition = (speechTask != nil || speechRequest != nil)
         speechTask?.cancel()
         speechTask = nil
         speechRequest?.endAudio()
@@ -306,6 +313,14 @@ private final class SoundDetector {
         } else {
             stopSpeechRecognition()
         }
+    }
+
+    func resetRecognitionState() {
+        nextSpeechRetryAt = .distantPast
+        isStoppingSpeechRecognition = false
+        lastCancelKeywordAt = .distantPast
+        lastRecognizedText = ""
+        lastRecognizedAt = .distantPast
     }
 
     private func isValid(format: AVAudioFormat) -> Bool {
@@ -1219,6 +1234,8 @@ struct ContentView: View {
         now = t
         phase = .startToRechaka
         cancelKeywordAcceptUntil = t.addingTimeInterval(5.0)
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
 
         lastAnnouncedBucketRechaka = -1
         if !speechEnableRechakaStart {
@@ -1340,12 +1357,16 @@ struct ContentView: View {
         if shouldMuteAfterRevert {
             soundInputMuted = true
         }
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
         ignoreDetectedUntil = Date().addingTimeInterval(1.0)
     }
 
     private func unmuteByVoiceCommand() {
         guard soundInputMuted else { return }
         soundInputMuted = false
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
         ignoreDetectedUntil = Date().addingTimeInterval(0.8)
     }
 
