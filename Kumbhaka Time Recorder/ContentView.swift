@@ -669,6 +669,7 @@ struct ContentView: View {
     @State private var ignoreDetectedUntil: Date = .distantPast
     @State private var soundInputMuted: Bool = true
     @State private var cancelKeywordAcceptUntil: Date = .distantPast
+    @State private var currentSessionStartedBySound: Bool = false
     @State private var preStartSnapshot: (startedAt: Date?, puraakaAt: Date?, lastRechaka: Double?, lastPuraaka: Double?, lastCompletedStartedAt: Date?)? = nil
     @State private var pendingAutoPuraakaStartWorkItem: DispatchWorkItem? = nil
     // ✅ 音声初期化は一度だけ
@@ -1171,6 +1172,7 @@ struct ContentView: View {
 
     private func handleStartButton() {
         if phase == .idle {
+            currentSessionStartedBySound = false
             startRechakaPhase()
         } else if phase == .waitPuraakaStart {
             startPuraakaPhaseManually()
@@ -1309,6 +1311,7 @@ struct ContentView: View {
         } else if announcer.isSpeaking {
             announcer.stopSpeaking(at: .immediate)
         }
+        currentSessionStartedBySound = false
         phase = .idle
         cancelKeywordAcceptUntil = .distantPast
 
@@ -1332,7 +1335,9 @@ struct ContentView: View {
         cancelKeywordAcceptUntil = .distantPast
         preStartSnapshot = nil
         cancelPendingAutoPuraakaStart()
-        if command == "mute" {
+        let shouldMuteAfterRevert = command == "mute" || currentSessionStartedBySound
+        currentSessionStartedBySound = false
+        if shouldMuteAfterRevert {
             soundInputMuted = true
         }
         ignoreDetectedUntil = Date().addingTimeInterval(1.0)
@@ -1373,6 +1378,7 @@ struct ContentView: View {
         switch phase {
         case .idle:
             if usesSoundStart {
+                currentSessionStartedBySound = true
                 startRechakaPhase()
             }
         case .startToRechaka:
