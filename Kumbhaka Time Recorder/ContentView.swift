@@ -790,96 +790,101 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: 16) {
+                ScrollView {
+                    VStack(spacing: 24) {
 
-                // ✅ 秒表示は画面中央固定／共有は右端
-                ZStack {
-                    elapsedHeader
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        // ✅ 秒表示は画面中央固定／共有は右端
+                        ZStack {
+                            elapsedHeader
+                                .frame(maxWidth: .infinity, alignment: .center)
 
-                    HStack {
-                        Spacer()
-                        ShareLink(item: mainShareText) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.title3)
-                                .padding(.vertical, 8)
-                                .padding(.horizontal, 10)
-                                .background(.thinMaterial)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .opacity(canShareFromMain ? 1.0 : 0.35)
-                        }
-                        .disabled(!canShareFromMain)
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                // ボタン群
-                VStack(spacing: 14) {
-                    bigButton(
-                        title: startButtonTitle,
-                        enabled: isReady && canTapStart,
-                        background: .blue
-                    ) {
-                        playTapSound()
-                        handleStartButton()
-                    }
-
-                    bigButton(
-                        title: rechakaStopButtonTitle,
-                        enabled: isReady && phase == .startToRechaka,
-                        background: .orange
-                    ) {
-                        playTapSound()
-                        rechakaStop()
-                    }
-
-                    bigButton(
-                        title: puraakaStopButtonTitle,
-                        enabled: isReady && phase == .puraakaRunning,
-                        background: .green
-                    ) {
-                        playTapSound()
-                        finishPuraakaAndSave()
-                    }
-
-                    if let guide = soundModeGuideText {
-                        Text(guide)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    // ✅ 準備中（上段のみ、青、ゆっくり点滅）
-                    if !isReady {
-                        Text("準備中")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.blue)
-                            .opacity(isPreparingBlink ? 0.25 : 1.0)
-                            .padding(.top, 4)
-                            .onAppear {
-                                isPreparingBlink = false
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
-                                        isPreparingBlink = true
-                                    }
+                            HStack {
+                                Spacer()
+                                ShareLink(item: mainShareText) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.title3)
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 10)
+                                        .background(.thinMaterial)
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                        .opacity(canShareFromMain ? 1.0 : 0.35)
                                 }
+                                .disabled(!canShareFromMain)
+                                .buttonStyle(.plain)
                             }
-                            .onChange(of: isReady) { _, newValue in
-                                if newValue { isPreparingBlink = false }
+                        }
+
+                        // ボタン群
+                        VStack(spacing: 14) {
+                            bigButton(
+                                title: startButtonTitle,
+                                enabled: isReady && canTapStart,
+                                background: .blue
+                            ) {
+                                playTapSound()
+                                handleStartButton()
                             }
+
+                            bigButton(
+                                title: rechakaStopButtonTitle,
+                                enabled: isReady && phase == .startToRechaka,
+                                background: .orange
+                            ) {
+                                playTapSound()
+                                rechakaStop()
+                            }
+
+                            bigButton(
+                                title: puraakaStopButtonTitle,
+                                enabled: isReady && phase == .puraakaRunning,
+                                background: .green
+                            ) {
+                                playTapSound()
+                                finishPuraakaAndSave()
+                            }
+
+                            if let guide = soundModeGuideText {
+                                Text(guide)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            // ✅ 準備中（上段のみ、青、ゆっくり点滅）
+                            if !isReady {
+                                Text("準備中")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.blue)
+                                    .opacity(isPreparingBlink ? 0.25 : 1.0)
+                                    .padding(.top, 4)
+                                    .onAppear {
+                                        isPreparingBlink = false
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                                                isPreparingBlink = true
+                                            }
+                                        }
+                                    }
+                                    .onChange(of: isReady) { _, newValue in
+                                        if newValue { isPreparingBlink = false }
+                                    }
+                            }
+                        }
+
+                        // 直近結果
+                        VStack(spacing: 8) {
+                            simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
+                            simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
+                        }
+                        .padding()
+                        .background(.thinMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                        // 今日分の履歴
+                        todayHistoryPanel
                     }
                 }
-
-                // 直近結果
-                VStack(spacing: 8) {
-                    simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
-                    simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
-                }
-                .padding()
-                .background(.thinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-
-                // 今日分の履歴
-                todayHistoryPanel
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                 // 履歴 / 設定
                 HStack(spacing: 12) {
@@ -907,8 +912,6 @@ struct ContentView: View {
                         .accessibilityLabel(soundInputMuted ? "ミュート解除" : "ミュート")
                     }
                 }
-
-                Spacer()
             }
             .padding()
             .background(
