@@ -3,6 +3,520 @@ import SwiftUI
 import SwiftData
 import AudioToolbox
 import AVFoundation
+import Speech
+import UIKit
+
+private final class SoundDetector {
+    enum DetectorError: Error {
+        case invalidInputFormat
+    }
+
+    private let engine = AVAudioEngine()
+    private var onDetect: (() -> Void)?
+    private var threshold: Float = 0.10
+    private var effectiveThreshold: Float = 0.10
+    private var cooldown: TimeInterval = 0.55
+    private var inputPriority: MicInputPriority = .auto
+    private var autoCalibrationEnabled: Bool = true
+    private var calibrationEndsAt: Date?
+    private var calibrationRmsTotal: Float = 0
+    private var calibrationSampleCount: Int = 0
+    private var calibrationPeakRms: Float = 0
+    private var lastDetectedAt: Date = .distantPast
+    private var wasLoud: Bool = false
+    private var routeChangeObserver: NSObjectProtocol?
+    private var onCancelKeyword: ((String) -> Void)?
+    private var isCancelKeywordAccepting: (() -> Bool)?
+    private var onUnmuteKeyword: (() -> Void)?
+    private var isUnmuteKeywordAccepting: (() -> Bool)?
+    private var onRecognitionDebug: ((String, Bool, Bool) -> Void)?
+    private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var speechTask: SFSpeechRecognitionTask?
+    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+    private var isStoppingSpeechRecognition = false
+    private var lastCancelKeywordAt: Date = .distantPast
+    private var lastRecognizedText: String = ""
+    private var lastRecognizedAt: Date = .distantPast
+    private var nextSpeechRetryAt: Date = .distantPast
+
+    func start(
+        threshold: Float = 0.10,
+        cooldown: TimeInterval = 0.55,
+        inputPriority: MicInputPriority = .auto,
+        autoCalibrationEnabled: Bool = true,
+        onCancelKeyword: ((String) -> Void)? = nil,
+        isCancelKeywordAccepting: (() -> Bool)? = nil,
+        onUnmuteKeyword: (() -> Void)? = nil,
+        isUnmuteKeywordAccepting: (() -> Bool)? = nil,
+        onRecognitionDebug: ((String, Bool, Bool) -> Void)? = nil,
+        onDetect: @escaping () -> Void
+    ) throws {
+        stop()
+
+        self.threshold = threshold
+        self.effectiveThreshold = threshold
+        self.cooldown = cooldown
+        self.inputPriority = inputPriority
+        self.autoCalibrationEnabled = autoCalibrationEnabled
+        self.onCancelKeyword = onCancelKeyword
+        self.isCancelKeywordAccepting = isCancelKeywordAccepting
+        self.onUnmuteKeyword = onUnmuteKeyword
+        self.isUnmuteKeywordAccepting = isUnmuteKeywordAccepting
+        self.onRecognitionDebug = onRecognitionDebug
+        self.onDetect = onDetect
+        resetCalibrationState()
+        if autoCalibrationEnabled {
+            calibrationEndsAt = Date().addingTimeInterval(1.0)
+        }
+
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+        )
+        try session.setActive(true)
+        try configureAudioSessionForCurrentRoute(session)
+        observeRouteChanges()
+
+        try reinstallTapAndRestartEngine()
+    }
+
+    func stop() {
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+            self.routeChangeObserver = nil
+        }
+        stopSpeechRecognition()
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        onDetect = nil
+        onCancelKeyword = nil
+        isCancelKeywordAccepting = nil
+        onUnmuteKeyword = nil
+        isUnmuteKeywordAccepting = nil
+        onRecognitionDebug = nil
+        wasLoud = false
+    }
+
+    private func observeRouteChanges() {
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleRouteChange()
+        }
+    }
+
+    private func handleRouteChange() {
+        guard onDetect != nil else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setActive(true)
+            try configureAudioSessionForCurrentRoute(session)
+            try reinstallTapAndRestartEngine()
+            wasLoud = false
+            lastDetectedAt = Date()
+            resetCalibrationState()
+            if autoCalibrationEnabled {
+                calibrationEndsAt = Date().addingTimeInterval(0.8)
+            }
+        } catch {
+            // 入力切替直後に一時失敗することがあるため、ここでは無視する。
+        }
+    }
+
+    private func reinstallTapAndRestartEngine() throws {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+
+        let inputNode = engine.inputNode
+        let inputFormat = inputNode.inputFormat(forBus: 0)
+        let outputFormat = inputNode.outputFormat(forBus: 0)
+        let format = isValid(format: inputFormat) ? inputFormat : outputFormat
+        guard isValid(format: format) else {
+            throw DetectorError.invalidInputFormat
+        }
+
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            if self?.onCancelKeyword != nil {
+                self?.speechRequest?.append(buffer)
+            }
+            self?.analyze(buffer: buffer)
+        }
+
+        restartSpeechRecognitionIfNeeded()
+        engine.prepare()
+        try engine.start()
+    }
+
+    private func analyze(buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData?[0] else { return }
+
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+
+        var sum: Float = 0
+        for i in stride(from: 0, to: frameCount, by: 2) {
+            let sample = channelData[i]
+            sum += sample * sample
+        }
+
+        let rms = sqrt(sum / Float(max(1, frameCount / 2)))
+        processCalibrationIfNeeded(rms: rms)
+
+        let now = Date()
+
+        if rms >= effectiveThreshold {
+            if !wasLoud && now.timeIntervalSince(lastDetectedAt) >= cooldown {
+                lastDetectedAt = now
+                DispatchQueue.main.async { [onDetect] in
+                    onDetect?()
+                }
+            }
+            wasLoud = true
+        } else if rms <= (effectiveThreshold * 0.5) {
+            wasLoud = false
+        }
+    }
+
+    private func processCalibrationIfNeeded(rms: Float) {
+        guard let calibrationEndsAt else { return }
+        if Date() < calibrationEndsAt {
+            calibrationRmsTotal += rms
+            calibrationSampleCount += 1
+            calibrationPeakRms = max(calibrationPeakRms, rms)
+            return
+        }
+
+        let average = calibrationRmsTotal / Float(max(1, calibrationSampleCount))
+        let candidate = max(threshold, average * 3.0, calibrationPeakRms * 0.65)
+        effectiveThreshold = min(0.40, max(0.02, candidate))
+        self.calibrationEndsAt = nil
+    }
+
+    private func resetCalibrationState() {
+        effectiveThreshold = threshold
+        calibrationRmsTotal = 0
+        calibrationSampleCount = 0
+        calibrationPeakRms = 0
+        calibrationEndsAt = nil
+    }
+
+    private func restartSpeechRecognitionIfNeeded() {
+        stopSpeechRecognition()
+        let shouldListenForCancel = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        let shouldListenForUnmute = (onUnmuteKeyword != nil) && (isUnmuteKeywordAccepting?() ?? false)
+        guard shouldListenForCancel || shouldListenForUnmute else { return }
+        guard Date() >= nextSpeechRetryAt else { return }
+        guard let speechRecognizer, speechRecognizer.isAvailable else { return }
+        isStoppingSpeechRecognition = false
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        speechRequest = request
+
+        speechTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if let text = result?.bestTranscription.formattedString {
+                self.handleRecognized(text)
+            }
+            if error != nil {
+                if self.isStoppingSpeechRecognition {
+                    self.isStoppingSpeechRecognition = false
+                    return
+                }
+                self.nextSpeechRetryAt = Date().addingTimeInterval(8.0)
+                self.stopSpeechRecognition()
+            }
+        }
+    }
+
+    private func stopSpeechRecognition() {
+        isStoppingSpeechRecognition = (speechTask != nil || speechRequest != nil)
+        speechTask?.cancel()
+        speechTask = nil
+        speechRequest?.endAudio()
+        speechRequest = nil
+    }
+
+    private func handleRecognized(_ text: String) {
+        let now = Date()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if trimmed == lastRecognizedText, now.timeIntervalSince(lastRecognizedAt) < 0.5 {
+            return
+        }
+        lastRecognizedText = trimmed
+        lastRecognizedAt = now
+
+        let normalized = text.lowercased().replacingOccurrences(
+            of: "[\\s、。,.!！?？・]",
+            with: "",
+            options: .regularExpression
+        )
+        let hasCancelHead = normalized.contains("キャン") ||
+            normalized.contains("きゃん") ||
+            normalized.contains("can")
+        let hasCancelTail = normalized.contains("セル") ||
+            normalized.contains("せる") ||
+            normalized.contains("sel") ||
+            normalized.contains("cell")
+        let isCancelWord = normalized.contains("キャンセル") ||
+            normalized.contains("きゃんせる") ||
+            normalized.contains("cancel") ||
+            (hasCancelHead && hasCancelTail) ||
+            normalized.contains("ストップ") ||
+            normalized.contains("すとっぷ") ||
+            normalized.contains("stop")
+        let isMuteWord = normalized.contains("ミュート") ||
+            normalized.contains("みゅーと") ||
+            normalized.contains("mute")
+        let isUnmuteWord = normalized.contains("ミュート解除") ||
+            normalized.contains("みゅーとかいじょ") ||
+            normalized.contains("unmute")
+        let matched = isCancelWord || isMuteWord || isUnmuteWord
+        let cancelAccepting = isCancelKeywordAccepting?() ?? false
+        let unmuteAccepting = isUnmuteKeywordAccepting?() ?? false
+        let acceptedCancel = (isCancelWord || isMuteWord) && cancelAccepting
+        let acceptedUnmute = isUnmuteWord && unmuteAccepting
+        let accepted = acceptedCancel || acceptedUnmute
+
+        DispatchQueue.main.async { [onRecognitionDebug] in
+            onRecognitionDebug?(trimmed, matched, accepted)
+        }
+
+        guard accepted else { return }
+
+        guard now.timeIntervalSince(lastCancelKeywordAt) >= 1.0 else { return }
+        lastCancelKeywordAt = now
+
+        DispatchQueue.main.async { [onCancelKeyword, onUnmuteKeyword] in
+            if acceptedUnmute {
+                onUnmuteKeyword?()
+            } else {
+                let command = isMuteWord ? "mute" : "cancel"
+                onCancelKeyword?(command)
+            }
+        }
+    }
+
+    func updateCancelKeywordListening() {
+        let shouldListenCancel = (onCancelKeyword != nil) && (isCancelKeywordAccepting?() ?? false)
+        let shouldListenUnmute = (onUnmuteKeyword != nil) && (isUnmuteKeywordAccepting?() ?? false)
+        let shouldListen = shouldListenCancel || shouldListenUnmute
+        if shouldListen {
+            if speechTask == nil {
+                restartSpeechRecognitionIfNeeded()
+            }
+        } else {
+            stopSpeechRecognition()
+        }
+    }
+
+    func resetRecognitionState() {
+        nextSpeechRetryAt = .distantPast
+        isStoppingSpeechRecognition = false
+        lastCancelKeywordAt = .distantPast
+        lastRecognizedText = ""
+        lastRecognizedAt = .distantPast
+    }
+
+    private func isValid(format: AVAudioFormat) -> Bool {
+        format.sampleRate > 0 && format.channelCount > 0
+    }
+
+    private func configureAudioSessionForCurrentRoute(_ session: AVAudioSession) throws {
+        let inputs = session.availableInputs ?? []
+        let builtInMic = inputs.first(where: { $0.portType == .builtInMic })
+        let bluetoothMic = inputs.first(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE })
+        let currentRoute = session.currentRoute
+        let isBluetoothRouteActive =
+            currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE }) ||
+            currentRoute.outputs.contains(where: { $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE })
+
+        switch inputPriority {
+        case .auto:
+            if isBluetoothRouteActive, let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+
+        case .builtIn:
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+
+        case .bluetooth:
+            if let bluetoothMic {
+                try session.setPreferredInput(bluetoothMic)
+                try session.setMode(.voiceChat)
+                return
+            }
+            if let builtInMic {
+                try session.setPreferredInput(builtInMic)
+                try session.setMode(.measurement)
+                try session.overrideOutputAudioPort(.speaker)
+                return
+            }
+        }
+
+        try session.setPreferredInput(nil)
+        try session.setMode(.measurement)
+        try session.overrideOutputAudioPort(.speaker)
+    }
+}
+
+private final class CueTonePlayer {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private let buffer: AVAudioPCMBuffer?
+
+    init() {
+        let sampleRate = 44_100.0
+        let duration = 0.08
+        let frameCount = AVAudioFrameCount(sampleRate * duration)
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
+        let buffer = format.flatMap { AVAudioPCMBuffer(pcmFormat: $0, frameCapacity: frameCount) }
+        self.buffer = buffer
+
+        if let format, let buffer, let channel = buffer.floatChannelData?[0] {
+            buffer.frameLength = frameCount
+            let frequency = 1760.0
+            for i in 0..<Int(frameCount) {
+                let progress = Double(i) / sampleRate
+                let envelope = 1.0 - (Double(i) / Double(frameCount))
+                let sample = sin(2.0 * Double.pi * frequency * progress) * 0.28 * envelope
+                channel[i] = Float(sample)
+            }
+
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+        }
+    }
+
+    func play() {
+        guard let buffer else { return }
+
+        do {
+            if !engine.isRunning {
+                try engine.start()
+            }
+            player.stop()
+            player.scheduleBuffer(buffer, at: nil, options: .interrupts)
+            player.play()
+        } catch {
+            AudioServicesPlaySystemSound(1104)
+        }
+    }
+}
+
+private struct RemoteKeyCaptureView: UIViewControllerRepresentable {
+    let handlers: [RemoteControlKey: () -> Void]
+
+    func makeUIViewController(context: Context) -> RemoteKeyCaptureController {
+        let controller = RemoteKeyCaptureController()
+        controller.handlers = handlers
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: RemoteKeyCaptureController, context: Context) {
+        uiViewController.handlers = handlers
+        DispatchQueue.main.async {
+            uiViewController.becomeFirstResponderIfPossible()
+        }
+    }
+}
+
+private final class RemoteKeyCaptureController: UIViewController {
+    var handlers: [RemoteControlKey: () -> Void] = [:] {
+        didSet { reloadKeyCommands() }
+    }
+
+    private var cachedCommands: [UIKeyCommand] = []
+
+    override var canBecomeFirstResponder: Bool { true }
+    override var keyCommands: [UIKeyCommand]? { cachedCommands }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
+    }
+
+    func becomeFirstResponderIfPossible() {
+        if view.window != nil {
+            becomeFirstResponder()
+        }
+    }
+
+    private func reloadKeyCommands() {
+        cachedCommands = handlers.keys.map { key in
+            let command = UIKeyCommand(
+                input: key.uiInput,
+                modifierFlags: [],
+                action: #selector(handleKeyCommand(_:))
+            )
+            command.discoverabilityTitle = key.label
+            return command
+        }
+    }
+
+    @objc private func handleKeyCommand(_ sender: UIKeyCommand) {
+        guard let input = sender.input else { return }
+        guard let key = RemoteControlKey(uiInput: input) else { return }
+        handlers[key]?()
+    }
+}
+
+private extension RemoteControlKey {
+    var uiInput: String {
+        switch self {
+        case .rightArrow: return UIKeyCommand.inputRightArrow
+        case .leftArrow: return UIKeyCommand.inputLeftArrow
+        case .upArrow: return UIKeyCommand.inputUpArrow
+        case .downArrow: return UIKeyCommand.inputDownArrow
+        case .returnKey: return "\r"
+        case .spaceKey: return " "
+        case .pageUp: return UIKeyCommand.inputPageUp
+        case .pageDown: return UIKeyCommand.inputPageDown
+        }
+    }
+
+    init?(uiInput: String) {
+        switch uiInput {
+        case UIKeyCommand.inputRightArrow: self = .rightArrow
+        case UIKeyCommand.inputLeftArrow: self = .leftArrow
+        case UIKeyCommand.inputUpArrow: self = .upArrow
+        case UIKeyCommand.inputDownArrow: self = .downArrow
+        case "\r": self = .returnKey
+        case " ": self = .spaceKey
+        case UIKeyCommand.inputPageUp: self = .pageUp
+        case UIKeyCommand.inputPageDown: self = .pageDown
+        default: return nil
+        }
+    }
+}
 
 // 表示形式
 enum TimeDisplayStyle: String, CaseIterable, Identifiable {
@@ -61,6 +575,47 @@ struct ContentView: View {
     private var rechakaStartMode: RechakaStartMode {
         RechakaStartMode(rawValue: rechakaStartModeRaw) ?? .auto
     }
+    @AppStorage("autoAdvanceMode") private var autoAdvanceModeRaw: String = AutoAdvanceMode.button.rawValue
+    private var autoAdvanceMode: AutoAdvanceMode {
+        AutoAdvanceMode(rawValue: autoAdvanceModeRaw) ?? .button
+    }
+    @AppStorage("soundStartMode") private var soundStartModeRaw: String = SoundStartMode.manual.rawValue
+    @AppStorage("soundDetectionThreshold") private var soundDetectionThreshold: Double = 0.09
+    @AppStorage("autoPuraakaDelaySeconds") private var autoPuraakaDelaySeconds: Double = 4.0
+    @AppStorage("micInputPriority") private var micInputPriorityRaw: String = MicInputPriority.auto.rawValue
+    @AppStorage("soundAutoCalibrationEnabled") private var soundAutoCalibrationEnabled: Bool = true
+    @AppStorage("remoteControlEnabled") private var remoteControlEnabled: Bool = true
+    @AppStorage("remoteProgressKey") private var remoteProgressKeyRaw: String = RemoteControlKey.rightArrow.rawValue
+    @AppStorage("remoteMuteKey") private var remoteMuteKeyRaw: String = RemoteControlKey.leftArrow.rawValue
+    @AppStorage("speechRecognitionDebugLog") private var speechRecognitionDebugLog: String = ""
+    @AppStorage("autoVoicePromptRechakaStart") private var autoVoicePromptRechakaStart: String = "レーチャカスタート"
+    @AppStorage("autoVoicePromptRechakaStop") private var autoVoicePromptRechakaStop: String = "レーチャカストップ"
+    @AppStorage("autoVoicePromptPuraakaStop") private var autoVoicePromptPuraakaStop: String = "プーラカストップ"
+    @AppStorage("speechRate") private var speechRate: Double = 0.5
+    @AppStorage("speechPitch") private var speechPitch: Double = 1.0
+    @AppStorage("speechVolume") private var speechVolume: Double = 1.0
+    @AppStorage("speechPronunciationMap") private var speechPronunciationMap: String = ""
+    @AppStorage("speechEnableRechakaStart") private var speechEnableRechakaStart: Bool = true
+    @AppStorage("speechEnableRechakaStop") private var speechEnableRechakaStop: Bool = true
+    @AppStorage("speechEnablePuraakaStart") private var speechEnablePuraakaStart: Bool = true
+    @AppStorage("speechEnablePuraakaStop") private var speechEnablePuraakaStop: Bool = true
+    @AppStorage("speechEnableResultSummary") private var speechEnableResultSummary: Bool = true
+    @AppStorage("speechEnableElapsedAnnouncement") private var speechEnableElapsedAnnouncement: Bool = true
+    private var usesSoundAdvance: Bool {
+        autoAdvanceMode == .sound
+    }
+    private var usesSoundStart: Bool {
+        SoundStartMode(rawValue: soundStartModeRaw) == .sound
+    }
+    private var micInputPriority: MicInputPriority {
+        MicInputPriority(rawValue: micInputPriorityRaw) ?? .auto
+    }
+    private var remoteProgressKey: RemoteControlKey {
+        RemoteControlKey(rawValue: remoteProgressKeyRaw) ?? .rightArrow
+    }
+    private var remoteMuteKey: RemoteControlKey {
+        RemoteControlKey(rawValue: remoteMuteKeyRaw) ?? .leftArrow
+    }
 
     // 表示形式
     @AppStorage("timeDisplayStyle") private var timeDisplayStyleRaw: String = TimeDisplayStyle.minuteSecond.rawValue
@@ -91,6 +646,16 @@ struct ContentView: View {
     private let hangThreshold: TimeInterval = 0.25
     private let requiredStable: TimeInterval = 2.0
 
+    // ===== 音検知 =====
+    @State private var soundDetector: SoundDetector = SoundDetector()
+    @State private var soundDetectorRunning = false
+    @State private var micPermissionAsked = false
+    @State private var micPermissionGranted = false
+    @State private var showMicPermissionAlert = false
+    @State private var speechPermissionAsked = false
+    @State private var speechPermissionGranted = false
+    @State private var showSpeechPermissionAlert = false
+
     // ===== フェーズ =====
     private enum Phase {
         case idle
@@ -116,10 +681,16 @@ struct ContentView: View {
     // ===== 10秒ごとのアナウンス =====
     @State private var lastAnnouncedBucketRechaka: Int = -1
     @State private var lastAnnouncedBucketPuraaka: Int = -1
-
+    @State private var ignoreDetectedUntil: Date = .distantPast
+    @State private var soundInputMuted: Bool = true
+    @State private var cancelKeywordAcceptUntil: Date = .distantPast
+    @State private var currentSessionStartedBySound: Bool = false
+    @State private var preStartSnapshot: (startedAt: Date?, puraakaAt: Date?, lastRechaka: Double?, lastPuraaka: Double?, lastCompletedStartedAt: Date?)? = nil
+    @State private var pendingAutoPuraakaStartWorkItem: DispatchWorkItem? = nil
     // ✅ 音声初期化は一度だけ
     @State private var didPrepareSpeech: Bool = false
     private let announcer = AVSpeechSynthesizer()
+    private let cueTonePlayer = CueTonePlayer()
 
     // ✅ 日付跨ぎ監視タスク
     @State private var midnightTask: Task<Void, Never>? = nil
@@ -160,7 +731,46 @@ struct ContentView: View {
     }
 
     private var canTapStart: Bool {
-        phase == .idle || phase == .waitPuraakaStart
+        phase == .idle || (phase == .waitPuraakaStart && rechakaStartMode == .manual)
+    }
+
+    private var soundModeGuideText: String? {
+        guard usesSoundAdvance else { return nil }
+
+        switch rechakaStartMode {
+        case .auto:
+            switch phase {
+            case .idle:
+                if usesSoundStart {
+                    return "次の音でレーチャカ開始（ボタン開始も可能）"
+                }
+                return "スタートでレーチャカ開始（音検知は起動時から有効）"
+            case .startToRechaka:
+                return "次の音でレーチャカ停止"
+            case .waitPuraakaStart:
+                return "レーチャカ停止後、5秒でプーラカ開始"
+            case .puraakaRunning:
+                return "次の音でストップして記録保存"
+            default:
+                return nil
+            }
+        case .manual:
+            switch phase {
+            case .idle:
+                if usesSoundStart {
+                    return "次の音でレーチャカ開始（ボタン開始も可能）"
+                }
+                return "レーチャカスタートで計測開始（音検知は起動時から有効）"
+            case .startToRechaka:
+                return "次の音でレーチャカ停止"
+            case .waitPuraakaStart:
+                return "次の音でプーラカ開始"
+            case .puraakaRunning:
+                return "次の音でストップして記録保存"
+            default:
+                return nil
+            }
+        }
     }
 
     // MARK: - メイン共有
@@ -180,90 +790,101 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: 16) {
+                ScrollView {
+                    VStack(spacing: 24) {
 
-                // ✅ 秒表示は画面中央固定／共有は右端
-                ZStack {
-                    elapsedHeader
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        // ✅ 秒表示は画面中央固定／共有は右端
+                        ZStack {
+                            elapsedHeader
+                                .frame(maxWidth: .infinity, alignment: .center)
 
-                    HStack {
-                        Spacer()
-                        ShareLink(item: mainShareText) {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.title3)
-                                .padding(.vertical, 8)
-                                .padding(.horizontal, 10)
-                                .background(.thinMaterial)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .opacity(canShareFromMain ? 1.0 : 0.35)
-                        }
-                        .disabled(!canShareFromMain)
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                // ボタン群
-                VStack(spacing: 14) {
-                    bigButton(
-                        title: startButtonTitle,
-                        enabled: isReady && canTapStart,
-                        background: .blue
-                    ) {
-                        playTapSound()
-                        handleStartButton()
-                    }
-
-                    bigButton(
-                        title: rechakaStopButtonTitle,
-                        enabled: isReady && phase == .startToRechaka,
-                        background: .orange
-                    ) {
-                        playTapSound()
-                        rechakaStop()
-                    }
-
-                    bigButton(
-                        title: puraakaStopButtonTitle,
-                        enabled: isReady && phase == .puraakaRunning,
-                        background: .green
-                    ) {
-                        playTapSound()
-                        finishPuraakaAndSave()
-                    }
-
-                    // ✅ 準備中（上段のみ、青、ゆっくり点滅）
-                    if !isReady {
-                        Text("準備中")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.blue)
-                            .opacity(isPreparingBlink ? 0.25 : 1.0)
-                            .padding(.top, 4)
-                            .onAppear {
-                                isPreparingBlink = false
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
-                                        isPreparingBlink = true
-                                    }
+                            HStack {
+                                Spacer()
+                                ShareLink(item: mainShareText) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.title3)
+                                        .padding(.vertical, 8)
+                                        .padding(.horizontal, 10)
+                                        .background(.thinMaterial)
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                        .opacity(canShareFromMain ? 1.0 : 0.35)
                                 }
+                                .disabled(!canShareFromMain)
+                                .buttonStyle(.plain)
                             }
-                            .onChange(of: isReady) { _, newValue in
-                                if newValue { isPreparingBlink = false }
+                        }
+
+                        // ボタン群
+                        VStack(spacing: 14) {
+                            bigButton(
+                                title: startButtonTitle,
+                                enabled: isReady && canTapStart,
+                                background: .blue
+                            ) {
+                                playTapSound()
+                                handleStartButton()
                             }
+
+                            bigButton(
+                                title: rechakaStopButtonTitle,
+                                enabled: isReady && phase == .startToRechaka,
+                                background: .orange
+                            ) {
+                                playTapSound()
+                                rechakaStop()
+                            }
+
+                            bigButton(
+                                title: puraakaStopButtonTitle,
+                                enabled: isReady && phase == .puraakaRunning,
+                                background: .green
+                            ) {
+                                playTapSound()
+                                finishPuraakaAndSave()
+                            }
+
+                            if let guide = soundModeGuideText {
+                                Text(guide)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            // ✅ 準備中（上段のみ、青、ゆっくり点滅）
+                            if !isReady {
+                                Text("準備中")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.blue)
+                                    .opacity(isPreparingBlink ? 0.25 : 1.0)
+                                    .padding(.top, 4)
+                                    .onAppear {
+                                        isPreparingBlink = false
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                                                isPreparingBlink = true
+                                            }
+                                        }
+                                    }
+                                    .onChange(of: isReady) { _, newValue in
+                                        if newValue { isPreparingBlink = false }
+                                    }
+                            }
+                        }
+
+                        // 直近結果
+                        VStack(spacing: 8) {
+                            simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
+                            simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
+                        }
+                        .padding()
+                        .background(.thinMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                        // 今日分の履歴
+                        todayHistoryPanel
                     }
                 }
-
-                // 直近結果
-                VStack(spacing: 8) {
-                    simpleResultRow(title: "レーチャカ", value: lastRechaka, titleColor: .orange)
-                    simpleResultRow(title: "プーラカ", value: lastPuraaka, titleColor: .green)
-                }
-                .padding()
-                .background(.thinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-
-                // 今日分の履歴
-                todayHistoryPanel
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                 // 履歴 / 設定
                 HStack(spacing: 12) {
@@ -274,11 +895,36 @@ struct ContentView: View {
                     NavigationLink("設定") { SettingsView() }
                         .buttonStyle(.bordered)
                         .disabled(!isReady)
-                }
 
-                Spacer()
+                    if usesSoundAdvance {
+                        Button {
+                            playTapSound()
+                            soundInputMuted.toggle()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: soundInputMuted ? "speaker.slash.fill" : "waveform")
+                                Text(soundInputMuted ? "ミュート中" : "音声認識中")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(soundInputMuted ? .red : .gray)
+                        .disabled(!isReady)
+                        .accessibilityLabel(soundInputMuted ? "ミュート解除" : "ミュート")
+                    }
+                }
             }
             .padding()
+            .background(
+                RemoteKeyCaptureView(
+                    handlers: remoteControlEnabled
+                        ? [
+                            remoteProgressKey: { handleRemoteProgressButton() },
+                            remoteMuteKey: { handleRemoteMuteButton() }
+                        ]
+                        : [:]
+                )
+                .frame(width: 0, height: 0)
+            )
             .task {
                 // 起動時に今日分を取得
                 await MainActor.run { fetchTodaySessions() }
@@ -293,6 +939,38 @@ struct ContentView: View {
             .onDisappear {
                 midnightTask?.cancel()
                 midnightTask = nil
+                cancelPendingAutoPuraakaStart()
+                stopSoundDetectionIfNeeded()
+            }
+            .onChange(of: soundDetectionThreshold) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .onChange(of: micInputPriorityRaw) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .onChange(of: soundAutoCalibrationEnabled) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .onChange(of: speechPermissionGranted) { _, _ in
+                if soundDetectorRunning {
+                    stopSoundDetectionIfNeeded()
+                }
+            }
+            .alert("マイク許可が必要です", isPresented: $showMicPermissionAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("音検知モードを使うには、マイク許可を有効にし、入力デバイスが利用可能な状態にしてください。")
+            }
+            .alert("音声認識の許可が必要です", isPresented: $showSpeechPermissionAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("スタート後5秒の「キャンセル / ストップ」取り消し機能には音声認識の許可が必要です。")
             }
         }
     }
@@ -494,12 +1172,10 @@ struct ContentView: View {
 
     private func elapsedText() -> String {
         switch phase {
-        case .idle:
+        case .idle, .waitPuraakaStart:
             return "0.0 秒"
         case .startToRechaka:
             return "\(truncate1(elapsed(from: startedAt))) 秒"
-        case .waitPuraakaStart:
-            return "0.0 秒"
         case .puraakaRunning:
             return "\(truncate1(elapsed(from: puraakaAt))) 秒"
         }
@@ -514,14 +1190,44 @@ struct ContentView: View {
 
     private func handleStartButton() {
         if phase == .idle {
+            currentSessionStartedBySound = false
             startRechakaPhase()
         } else if phase == .waitPuraakaStart {
             startPuraakaPhaseManually()
         }
     }
 
+    private func handleRemoteProgressButton() {
+        guard remoteControlEnabled, isReady else { return }
+
+        if canTapStart {
+            handleStartButton()
+            return
+        }
+        if phase == .startToRechaka {
+            rechakaStop()
+            return
+        }
+        if phase == .puraakaRunning {
+            finishPuraakaAndSave()
+        }
+    }
+
+    private func handleRemoteMuteButton() {
+        guard remoteControlEnabled, isReady else { return }
+        soundInputMuted.toggle()
+    }
+
     private func startRechakaPhase() {
+        cancelPendingAutoPuraakaStart()
         prepareSpeechIfNeeded()
+        preStartSnapshot = (
+            startedAt: startedAt,
+            puraakaAt: puraakaAt,
+            lastRechaka: lastRechaka,
+            lastPuraaka: lastPuraaka,
+            lastCompletedStartedAt: lastCompletedStartedAt
+        )
 
         let t = Date()
         startedAt = t
@@ -530,9 +1236,18 @@ struct ContentView: View {
         puraakaAt = nil
         now = t
         phase = .startToRechaka
+        cancelKeywordAcceptUntil = t.addingTimeInterval(5.0)
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
 
         lastAnnouncedBucketRechaka = -1
-        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
+        if !speechEnableRechakaStart {
+            if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
+        } else if rechakaStartMode == .auto {
+            speak(normalizedPrompt(autoVoicePromptRechakaStart, fallback: "レーチャカスタート"), suppressDetection: true)
+        } else {
+            speak("レーチャカスタート", suppressDetection: true)
+        }
     }
 
     private func rechakaStop() {
@@ -543,19 +1258,28 @@ struct ContentView: View {
 
         switch rechakaStartMode {
         case .auto:
-            puraakaAt = t
-            lastAnnouncedBucketPuraaka = -1
-            if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
-            phase = .puraakaRunning
+            puraakaAt = nil
+            phase = .waitPuraakaStart
+            if speechEnableRechakaStop {
+                speak(normalizedPrompt(autoVoicePromptRechakaStop, fallback: "レーチャカストップ"), suppressDetection: true)
+            } else if announcer.isSpeaking {
+                announcer.stopSpeaking(at: .immediate)
+            }
+            scheduleAutoPuraakaStart(after: autoPuraakaDelaySeconds)
 
         case .manual:
             puraakaAt = nil
-            if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
             phase = .waitPuraakaStart
+            if speechEnableRechakaStop {
+                speak("レーチャカストップ", suppressDetection: true)
+            } else if announcer.isSpeaking {
+                announcer.stopSpeaking(at: .immediate)
+            }
         }
     }
 
     private func startPuraakaPhaseManually() {
+        cancelPendingAutoPuraakaStart()
         prepareSpeechIfNeeded()
 
         let t = Date()
@@ -564,11 +1288,16 @@ struct ContentView: View {
         phase = .puraakaRunning
 
         lastAnnouncedBucketPuraaka = -1
-        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
+        if speechEnablePuraakaStart {
+            speak("プーラカスタート", suppressDetection: true)
+        } else if announcer.isSpeaking {
+            announcer.stopSpeaking(at: .immediate)
+        }
     }
 
     private func finishPuraakaAndSave() {
         guard let startedAt, let puraakaAt else { return }
+        cancelPendingAutoPuraakaStart()
         let t = Date()
 
         lastPuraaka = t.timeIntervalSince(puraakaAt)
@@ -582,11 +1311,133 @@ struct ContentView: View {
 
         lastCompletedStartedAt = startedAt
 
-        if announcer.isSpeaking { announcer.stopSpeaking(at: .immediate) }
+        let rechakaText = Self.formatTime(lastRechaka, style: timeDisplayStyle)
+        let puraakaText = Self.formatTime(lastPuraaka, style: timeDisplayStyle)
+        let resultPrompt = "今回の記録は、レーチャカ \(rechakaText) プーラカ \(puraakaText) でした。"
+        var prompts: [String] = []
+        if speechEnablePuraakaStop {
+            if rechakaStartMode == .auto {
+                prompts.append(normalizedPrompt(autoVoicePromptPuraakaStop, fallback: "プーラカストップ"))
+            } else {
+                prompts.append("プーラカストップ")
+            }
+        }
+        if speechEnableResultSummary {
+            prompts.append(resultPrompt)
+        }
+
+        if !prompts.isEmpty {
+            speak(prompts.joined(separator: "。"), suppressDetection: true)
+        } else if announcer.isSpeaking {
+            announcer.stopSpeaking(at: .immediate)
+        }
+        currentSessionStartedBySound = false
         phase = .idle
+        cancelKeywordAcceptUntil = .distantPast
 
         // ✅ 保存後に今日分を再取得（即時反映）
         fetchTodaySessions()
+    }
+
+    private func revertToBeforeStartByVoiceCommand(command: String) {
+        guard Date() <= cancelKeywordAcceptUntil else { return }
+        guard let snapshot = preStartSnapshot else { return }
+
+        startedAt = snapshot.startedAt
+        puraakaAt = snapshot.puraakaAt
+        lastRechaka = snapshot.lastRechaka
+        lastPuraaka = snapshot.lastPuraaka
+        lastCompletedStartedAt = snapshot.lastCompletedStartedAt
+        phase = .idle
+        now = Date()
+        lastAnnouncedBucketRechaka = -1
+        lastAnnouncedBucketPuraaka = -1
+        cancelKeywordAcceptUntil = .distantPast
+        preStartSnapshot = nil
+        cancelPendingAutoPuraakaStart()
+        let shouldMuteAfterRevert = command == "mute" || currentSessionStartedBySound
+        currentSessionStartedBySound = false
+        if shouldMuteAfterRevert {
+            soundInputMuted = true
+        }
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
+        ignoreDetectedUntil = Date().addingTimeInterval(1.0)
+    }
+
+    private func unmuteByVoiceCommand() {
+        guard soundInputMuted else { return }
+        soundInputMuted = false
+        soundDetector.resetRecognitionState()
+        soundDetector.updateCancelKeywordListening()
+        ignoreDetectedUntil = Date().addingTimeInterval(0.8)
+    }
+
+    private func appendSpeechRecognitionLog(text: String, matchedKeyword: Bool, accepted: Bool) {
+        let status: String
+        if accepted {
+            status = "受理"
+        } else if matchedKeyword {
+            status = "一致(無効時間)"
+        } else {
+            status = "無視"
+        }
+        let timestamp = Self.timeOnly.string(from: Date())
+        let line = "\(timestamp) [\(status)] \(text)"
+
+        var lines = speechRecognitionDebugLog.split(whereSeparator: \.isNewline).map(String.init)
+        lines.append(line)
+        if lines.count > 120 {
+            lines.removeFirst(lines.count - 120)
+        }
+        speechRecognitionDebugLog = lines.joined(separator: "\n")
+    }
+
+    private func handleDetectedSoundAdvance() {
+        guard isReady, usesSoundAdvance else { return }
+        guard !soundInputMuted else { return }
+        guard Date() >= ignoreDetectedUntil else { return }
+        guard !(phase == .idle && announcer.isSpeaking) else { return }
+
+        switch phase {
+        case .idle:
+            if usesSoundStart {
+                currentSessionStartedBySound = true
+                startRechakaPhase()
+            }
+        case .startToRechaka:
+            rechakaStop()
+        case .waitPuraakaStart:
+            if rechakaStartMode == .manual {
+                startPuraakaPhaseManually()
+            }
+        case .puraakaRunning:
+            finishPuraakaAndSave()
+        default:
+            break
+        }
+    }
+
+    private func scheduleAutoPuraakaStart(after delay: TimeInterval) {
+        cancelPendingAutoPuraakaStart()
+        let work = DispatchWorkItem {
+            self.pendingAutoPuraakaStartWorkItem = nil
+            guard self.rechakaStartMode == .auto, self.phase == .waitPuraakaStart else { return }
+
+            self.playResumeCueSound()
+            let t = Date()
+            self.puraakaAt = t
+            self.now = t
+            self.phase = .puraakaRunning
+            self.lastAnnouncedBucketPuraaka = -1
+        }
+        pendingAutoPuraakaStartWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func cancelPendingAutoPuraakaStart() {
+        pendingAutoPuraakaStartWorkItem?.cancel()
+        pendingAutoPuraakaStartWorkItem = nil
     }
 
     // MARK: - Stability
@@ -616,8 +1467,9 @@ struct ContentView: View {
                 }
             }
 
+            refreshSoundDetectionStateIfNeeded()
+            soundDetector.updateCancelKeywordListening()
             announceIfNeeded()
-
             try? await Task.sleep(nanoseconds: tickInterval)
         }
     }
@@ -625,6 +1477,7 @@ struct ContentView: View {
     // 10秒ごとの読み上げ（レーチャカ/プーラカ別カウント）
     private func announceIfNeeded() {
         guard isReady else { return }
+        guard speechEnableElapsedAnnouncement else { return }
 
         switch phase {
         case .startToRechaka:
@@ -646,6 +1499,104 @@ struct ContentView: View {
         default:
             break
         }
+    }
+
+    private func refreshSoundDetectionStateIfNeeded() {
+        guard usesSoundAdvance else {
+            stopSoundDetectionIfNeeded()
+            return
+        }
+
+        guard isReady else { return }
+
+        if soundDetectorRunning { return }
+
+        if !speechPermissionGranted {
+            requestSpeechPermissionIfNeeded()
+        }
+
+        if micPermissionGranted {
+            do {
+                try soundDetector.start(
+                    threshold: Float(soundDetectionThreshold),
+                    cooldown: 0.5,
+                    inputPriority: micInputPriority,
+                    autoCalibrationEnabled: soundAutoCalibrationEnabled,
+                    onCancelKeyword: speechPermissionGranted ? { command in
+                        revertToBeforeStartByVoiceCommand(command: command)
+                    } : nil,
+                    isCancelKeywordAccepting: {
+                        Date() <= cancelKeywordAcceptUntil && !soundInputMuted
+                    },
+                    onUnmuteKeyword: speechPermissionGranted ? {
+                        unmuteByVoiceCommand()
+                    } : nil,
+                    isUnmuteKeywordAccepting: {
+                        soundInputMuted
+                    },
+                    onRecognitionDebug: { text, matched, accepted in
+                        appendSpeechRecognitionLog(text: text, matchedKeyword: matched, accepted: accepted)
+                    }
+                ) {
+                    handleDetectedSoundAdvance()
+                }
+                soundDetectorRunning = true
+            } catch {
+                soundDetectorRunning = false
+                showMicPermissionAlert = true
+            }
+            return
+        }
+
+        if !micPermissionAsked {
+            micPermissionAsked = true
+            let permissionHandler: (Bool) -> Void = { granted in
+                DispatchQueue.main.async {
+                    micPermissionGranted = granted
+                    if !granted {
+                        showMicPermissionAlert = true
+                    }
+                }
+            }
+
+            if #available(iOS 17.0, *) {
+                AVAudioApplication.requestRecordPermission(completionHandler: permissionHandler)
+            } else {
+                AVAudioSession.sharedInstance().requestRecordPermission(permissionHandler)
+            }
+        }
+    }
+
+    private func requestSpeechPermissionIfNeeded() {
+        let status = SFSpeechRecognizer.authorizationStatus()
+        if status == .authorized {
+            speechPermissionAsked = true
+            speechPermissionGranted = true
+            return
+        }
+        if status == .denied || status == .restricted {
+            speechPermissionAsked = true
+            speechPermissionGranted = false
+            showSpeechPermissionAlert = true
+            return
+        }
+
+        guard !speechPermissionAsked else { return }
+        speechPermissionAsked = true
+        SFSpeechRecognizer.requestAuthorization { result in
+            DispatchQueue.main.async {
+                speechPermissionGranted = (result == .authorized)
+                if !speechPermissionGranted {
+                    showSpeechPermissionAlert = true
+                }
+            }
+        }
+    }
+
+    private func stopSoundDetectionIfNeeded() {
+        guard soundDetectorRunning else { return }
+        soundDetector.stop()
+        soundDetectorRunning = false
     }
 
     private func prepareSpeechIfNeeded() {
@@ -670,16 +1621,58 @@ struct ContentView: View {
         }
     }
 
-    private func speak(_ text: String) {
+    private func speak(_ text: String, suppressDetection: Bool = false) {
+        // ボタン状態が変わる案内時のみ、短時間だけ検知を無効化する
+        if suppressDetection {
+            let suppressionSeconds = (rechakaStartMode == .manual) ? 2.0 : 4.0
+            ignoreDetectedUntil = Date().addingTimeInterval(suppressionSeconds)
+        }
         if announcer.isSpeaking {
             announcer.stopSpeaking(at: .immediate)
         }
-        let u = AVSpeechUtterance(string: text)
+        let convertedText = applyPronunciationOverrides(to: text)
+        let u = AVSpeechUtterance(string: convertedText)
         u.voice = AVSpeechSynthesisVoice(language: "ja-JP")
-        u.rate = 0.5
-        u.pitchMultiplier = 1.0
-        u.volume = 1.0
+        u.rate = Float(min(0.65, max(0.30, speechRate)))
+        u.pitchMultiplier = Float(min(1.40, max(0.70, speechPitch)))
+        let boostedVolume = min(1.0, max(0.0, speechVolume * 1.25))
+        u.volume = Float(boostedVolume)
         announcer.speak(u)
+    }
+
+    private func applyPronunciationOverrides(to text: String) -> String {
+        let lines = speechPronunciationMap.split(whereSeparator: \.isNewline)
+        guard !lines.isEmpty else { return text }
+
+        var converted = text
+        for line in lines {
+            let raw = line.trimmingCharacters(in: .whitespaces)
+            guard !raw.isEmpty else { continue }
+
+            let from: String
+            let to: String
+            if let r = raw.range(of: "=") {
+                from = String(raw[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                to = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            } else if let r = raw.range(of: "：") {
+                from = String(raw[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                to = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            } else if let r = raw.range(of: "->") {
+                from = String(raw[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                to = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            } else {
+                continue
+            }
+
+            guard !from.isEmpty, !to.isEmpty else { continue }
+            converted = converted.replacingOccurrences(of: from, with: to)
+        }
+        return converted
+    }
+
+    private func normalizedPrompt(_ raw: String, fallback: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
     }
 
     // MARK: - UI / Formatting
@@ -702,6 +1695,10 @@ struct ContentView: View {
 
     private func playTapSound() {
         AudioServicesPlaySystemSound(1104)
+    }
+
+    private func playResumeCueSound() {
+        cueTonePlayer.play()
     }
 
     private func bigButton(title: String, enabled: Bool, background: Color, action: @escaping () -> Void) -> some View {
